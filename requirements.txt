@@ -1,1 +1,4 @@
 pybullet>=3.2.5
+# 4.x line only: OpenCV 5 removed the Haar cascade API (cv2.CascadeClassifier)
+# and the bundled haarcascade_*.xml data that the attention proxy relies on.
+opencv-python>=4.8,<5
