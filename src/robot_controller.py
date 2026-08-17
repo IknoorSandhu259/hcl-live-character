@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Mapping, Optional
 import time
+import xml.etree.ElementTree as ET
 
 import pybullet as p
 
@@ -51,12 +52,6 @@ ACTUATED_JOINTS = (
 #: PyBullet gives each of them a default 1 kg. See _zero_semantic_frame_masses.
 SEMANTIC_FRAME_LINKS = ("light_emitter_link", "camera_link", "speaker_link")
 
-#: Keep commanded targets this far away from the URDF hard stops. The URDF also
-#: declares ``safety_controller`` soft limits 0.10-0.15 rad inside the hard
-#: limits; PyBullet does not expose those, so we apply our own margin in the
-#: same spirit. Never larger than 10% of the joint's range.
-LIMIT_MARGIN_RAD = 0.05
-
 #: Simulation step. 240 Hz is PyBullet's default and keeps the position
 #: controller stable at these gains.
 TIME_STEP = 1.0 / 240.0
@@ -68,19 +63,25 @@ VELOCITY_SCALE = 0.5
 
 @dataclass(frozen=True)
 class JointSpec:
-    """Physical constraints of one actuated joint, read from the loaded model."""
+    """Physical constraints of one actuated joint.
+
+    Hard limits come from PyBullet/URDF joint metadata. Commanded target
+    positions are conservatively restricted to the URDF-declared soft position
+    bounds. The gain-based ``safety_controller`` dynamics are not modeled.
+    """
 
     name: str
     index: int
     lower: float
     upper: float
+    soft_lower: float
+    soft_upper: float
     max_force: float
     max_velocity: float
 
     def clamp(self, position: float) -> float:
-        """Clamp *position* into the safe band inside the URDF limits."""
-        margin = min(LIMIT_MARGIN_RAD, 0.1 * (self.upper - self.lower))
-        return max(self.lower + margin, min(self.upper - margin, position))
+        """Clamp *position* to the URDF-declared soft position bounds."""
+        return max(self.soft_lower, min(self.soft_upper, position))
 
 
 # --------------------------------------------------------------------------
@@ -88,8 +89,9 @@ class JointSpec:
 # --------------------------------------------------------------------------
 #
 # Poses are plain dictionaries of joint name -> angle, kept deliberately small
-# and readable. Values were chosen inside the URDF limits (printed by
-# LampController.describe()) and are clamped again at execution time.
+# and readable. Values were chosen inside the URDF-declared soft position
+# bounds (printed by LampController.describe()) and are clamped again at
+# execution time.
 
 Pose = Mapping[str, float]
 
@@ -163,6 +165,32 @@ def _zero_semantic_frame_masses(body_id: int, client_id: int) -> None:
             )
 
 
+def _read_soft_limits_from_urdf() -> Dict[str, tuple[float, float]]:
+    """Read declared safety-controller position bounds from the supplied URDF.
+
+    The gains and velocity term in ``safety_controller`` are intentionally not
+    modeled; only its declared soft position bounds are used for targets.
+    """
+    root = ET.parse(URDF_PATH).getroot()
+    soft_limits: Dict[str, tuple[float, float]] = {}
+    for joint in root.findall("joint"):
+        safety = joint.find("safety_controller")
+        if safety is None:
+            continue
+        name = joint.get("name")
+        if name in ACTUATED_JOINTS:
+            lower = float(safety.attrib["soft_lower_limit"])
+            upper = float(safety.attrib["soft_upper_limit"])
+            if lower >= upper:
+                raise ValueError(f"joint '{name}' has no usable soft range: [{lower}, {upper}]")
+            soft_limits[name] = (lower, upper)
+
+    missing = [name for name in ACTUATED_JOINTS if name not in soft_limits]
+    if missing:
+        raise ValueError(f"URDF is missing soft limits for expected actuated joints: {missing}")
+    return soft_limits
+
+
 # --------------------------------------------------------------------------
 # Controller
 # --------------------------------------------------------------------------
@@ -172,7 +200,8 @@ class LampController:
     """Joint-space execution boundary for the five-DOF lamp.
 
     Discovers the actuated joints by *name* (never by hardcoded index), reads
-    their limits from the loaded model, and refuses to command anything else.
+    their hard limits from the loaded model and soft target bounds from the
+    supplied URDF, and refuses to command anything else.
     """
 
     def __init__(self, body_id: int, client_id: int, realtime: Optional[bool] = None):
@@ -193,6 +222,7 @@ class LampController:
     def _discover_joints(self) -> Dict[str, JointSpec]:
         """Map the expected joint names onto the actually loaded model."""
         found: Dict[str, JointSpec] = {}
+        soft_limits = _read_soft_limits_from_urdf()
         for index in range(p.getNumJoints(self.body_id, physicsClientId=self.client_id)):
             info = p.getJointInfo(self.body_id, index, physicsClientId=self.client_id)
             name = info[1].decode()
@@ -207,11 +237,19 @@ class LampController:
             lower, upper = info[8], info[9]
             if lower >= upper:
                 raise ValueError(f"joint '{name}' has no usable range: [{lower}, {upper}]")
+            soft_lower, soft_upper = soft_limits[name]
+            if soft_lower < lower or soft_upper > upper:
+                raise ValueError(
+                    f"joint '{name}' soft limits [{soft_lower}, {soft_upper}] exceed "
+                    f"hard limits [{lower}, {upper}]"
+                )
             found[name] = JointSpec(
                 name=name,
                 index=index,
                 lower=lower,
                 upper=upper,
+                soft_lower=soft_lower,
+                soft_upper=soft_upper,
                 max_force=info[10],
                 max_velocity=info[11],
             )
@@ -231,6 +269,7 @@ class LampController:
             lines.append(
                 f"  [{spec.index}] {spec.name}: "
                 f"limits [{spec.lower:+.3f}, {spec.upper:+.3f}] rad, "
+                f"soft targets [{spec.soft_lower:+.3f}, {spec.soft_upper:+.3f}] rad, "
                 f"max_force {spec.max_force:.1f} N*m, max_velocity {spec.max_velocity:.2f} rad/s"
             )
         return "\n".join(lines)
