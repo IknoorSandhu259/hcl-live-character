@@ -66,7 +66,11 @@ RESPONSE_SCHEMA: dict[str, Any] = {
         "behavior": {
             "type": "string",
             "enum": list(ALLOWED_BEHAVIORS),
-            "description": "At most one physical gesture; none is the default.",
+            "description": (
+                "At most one physical gesture. Defaults to 'none', which is correct for most "
+                "turns. 'nod' only for an explicit request to move or a direct yes/agreement; "
+                "'engage' only when the person is asking for your attention itself."
+            ),
         },
     },
     "required": ["reply", "behavior"],
