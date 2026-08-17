@@ -21,20 +21,46 @@ Design notes
   It is imported lazily so that importing this module -- as the tests do --
   never probes the audio subsystem.
 * **Playback is split into prepare + play.** Everything that can fail while
-  turning WAV bytes into something the sound card will accept -- container
-  parsing, sample width, NumPy conversion, loading PortAudio, asking the
-  output device whether it supports this rate -- happens in
-  :meth:`SpeakerPlayer.prepare`, which the caller runs *before* it moves the
-  robot. ``play()`` is then only the handoff to PortAudio. See ``voice_turn``
-  for why that ordering matters.
+  turning WAV bytes into something playable -- container parsing, sample
+  width, NumPy conversion, loading PortAudio, asking the output device whether
+  it supports this rate, locating a system player -- happens in
+  ``prepare()``, which the caller runs *before* it moves the robot.
+  ``play()`` is then only the handoff. See ``voice_turn`` for why that
+  ordering matters.
+
+Two playback backends
+---------------------
+:class:`SpeakerPlayer` picks one at construction:
+
+* :class:`SystemCommandPlayer` hands the WAV to the platform's own player
+  (``afplay`` on macOS, ``paplay``/``aplay`` on Linux) as a **separate
+  process**. Preferred wherever such a binary exists.
+* :class:`SounddevicePlayer` streams the samples in-process through PortAudio.
+  Used when no system player is available (notably Windows).
+
+The split exists because in-process PortAudio playback and a PyBullet **GUI**
+in the same interpreter fight over the GIL: sounddevice's stream callback is
+Python code invoked from the CoreAudio/ALSA real-time thread, and it has to
+take the GIL to run. PyBullet's GUI renderer holds the GIL in long bursts, the
+callback misses its deadline, and the output underruns -- audible as heavy
+static. The effect is absent headless (``--headless``) and absent when the
+same WAV is played by any separate process, which is exactly what handing the
+file to ``afplay`` restores. A separate process has its own interpreter lock,
+so no amount of rendering in ours can starve its audio thread.
 """
 
 from __future__ import annotations
 
+import atexit
 import io
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import wave
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol, Sequence
 
 # --------------------------------------------------------------------------
 # Capture format
@@ -82,21 +108,25 @@ class AudioError(RuntimeError):
 
 @dataclass(frozen=True)
 class PreparedPlayback:
-    """Decoded, validated audio that the output device has already accepted.
+    """Validated audio that the chosen backend has already accepted.
 
     Holding one of these is the evidence ``voice_turn`` needs that speaking is
     very likely to succeed. It is not a guarantee -- a device can still be
     unplugged between prepare and play -- but every failure mode we can check
     cheaply has been checked by the time this exists.
+
+    Exactly one of ``samples`` / ``path`` is populated, depending on backend.
     """
 
-    #: Interleaved int16 samples, shaped (frames, channels). Typed loosely so
-    #: this module's public surface does not force a NumPy import on callers.
-    samples: Any
     sample_rate: int
     channels: int
     #: Wall-clock length, used by the caller to know when the lamp stops talking.
     seconds: float
+    #: Interleaved int16 samples, shaped (frames, channels). Typed loosely so
+    #: this module's public surface does not force a NumPy import on callers.
+    samples: Any = None
+    #: Path to a WAV file on disk, for the system-player backend.
+    path: Optional[str] = None
 
 
 class Recorder(Protocol):
@@ -257,18 +287,17 @@ class MicrophoneRecorder:
         )
 
 
-class SpeakerPlayer:
-    """Plays a WAV buffer through the default output device.
+class SounddevicePlayer:
+    """Streams samples through PortAudio, in this process.
 
-    Split in two on purpose: see the module docstring and ``voice_turn``.
+    The portable fallback. Correct everywhere, but shares the interpreter --
+    and therefore the GIL -- with whatever else is running, which is why it is
+    not the first choice when a PyBullet GUI is on screen. See the module
+    docstring.
     """
 
     def prepare(self, wav_bytes: bytes) -> PreparedPlayback:
-        """Decode and validate audio, and confirm the device will accept it.
-
-        Everything that can go wrong short of the device physically vanishing
-        goes wrong here, before the caller commits to moving the robot.
-        """
+        """Decode and validate audio, and confirm the device will accept it."""
         if not wav_bytes:
             raise AudioError("no audio to play")
 
@@ -303,11 +332,151 @@ class SpeakerPlayer:
         """Hand the prepared samples to PortAudio and return immediately.
 
         Non-blocking on purpose: the caller is the engagement loop, which must
-        keep reading camera frames while the character is talking. PortAudio
-        drains the buffer on its own thread.
+        keep reading camera frames while the character is talking.
+
+        ``latency="high"`` asks PortAudio for the largest buffer it considers
+        reasonable. It does not remove the GIL contention described in the
+        module docstring, but it widens the deadline the stream callback has to
+        meet, which is the most this backend can do about it from inside the
+        same interpreter.
         """
         sd = _sounddevice()
         try:
-            sd.play(prepared.samples, samplerate=prepared.sample_rate, blocking=False)
+            sd.play(
+                prepared.samples,
+                samplerate=prepared.sample_rate,
+                blocking=False,
+                latency="high",
+            )
         except Exception as exc:
             raise AudioError(f"could not play audio on the default speaker: {exc}") from exc
+
+
+#: System players to look for, per platform, best first. Each entry is the
+#: argv prefix; the WAV path is appended. All of these take a plain RIFF/WAV
+#: file and exit when it finishes.
+SYSTEM_PLAYERS: dict[str, Sequence[Sequence[str]]] = {
+    "darwin": (("afplay",),),
+    # paplay covers PulseAudio and PipeWire's pulse shim, which is what a
+    # stock Ubuntu 24.04 desktop runs; aplay is the bare-ALSA fallback.
+    "linux": (("paplay",), ("aplay", "-q")),
+}
+
+
+def find_system_player(platform: Optional[str] = None) -> Optional[list[str]]:
+    """Return the argv prefix of an available system player, or None."""
+    for candidate in SYSTEM_PLAYERS.get(platform or sys.platform, ()):
+        binary = shutil.which(candidate[0])
+        if binary:
+            return [binary, *candidate[1:]]
+    return None
+
+
+class SystemCommandPlayer:
+    """Plays a WAV by handing the file to the platform's own player process.
+
+    The point is the process boundary, not the binary: a separate process has
+    its own GIL, so PyBullet's GUI renderer cannot starve its audio thread.
+    Playback stays non-blocking -- we spawn and return, exactly as the
+    in-process backend does.
+    """
+
+    def __init__(self, command: Optional[Sequence[str]] = None):
+        resolved = list(command) if command else find_system_player()
+        if not resolved:
+            raise AudioError(f"no system audio player found for platform {sys.platform!r}")
+        self.command = resolved
+        self._directory = tempfile.mkdtemp(prefix="lamp-tts-")
+        self._counter = 0
+        #: The file from the previous turn, deleted once the next one starts.
+        self._previous: Optional[str] = None
+        atexit.register(self._cleanup)
+
+    def prepare(self, wav_bytes: bytes) -> PreparedPlayback:
+        """Validate the audio and stage it on disk for the player process."""
+        if not wav_bytes:
+            raise AudioError("no audio to play")
+
+        # Same validation as the in-process backend: a malformed or non-PCM16
+        # buffer must fail here, before the robot moves, not inside afplay.
+        pcm, sample_rate, channels, width = decode_wav(wav_bytes)
+
+        self._discard_previous()
+        self._counter += 1
+        path = os.path.join(self._directory, f"reply-{self._counter}.wav")
+        try:
+            with open(path, "wb") as handle:
+                handle.write(wav_bytes)
+        except OSError as exc:
+            raise AudioError(f"could not stage audio for playback: {exc}") from exc
+
+        self._previous = path
+        frames = len(pcm) // (channels * width)
+        return PreparedPlayback(
+            sample_rate=sample_rate,
+            channels=channels,
+            seconds=frames / float(sample_rate),
+            path=path,
+        )
+
+    def play(self, prepared: PreparedPlayback) -> None:
+        """Spawn the player and return immediately."""
+        if not prepared.path:
+            raise AudioError("this backend needs audio staged on disk")
+        try:
+            subprocess.Popen(  # noqa: S603 - fixed argv, resolved binary, no shell
+                [*self.command, prepared.path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            raise AudioError(
+                f"could not start {self.command[0]!r} to play the reply: {exc}"
+            ) from exc
+
+    # -- housekeeping ------------------------------------------------------
+
+    def _discard_previous(self) -> None:
+        """Delete the last turn's file. Safe: a new turn cannot start while
+        the previous reply is still playing (VoiceSession.mark_speaking)."""
+        if self._previous:
+            try:
+                os.unlink(self._previous)
+            except OSError:
+                pass  # already gone, or still held; the temp dir sweeps it up
+            self._previous = None
+
+    def _cleanup(self) -> None:
+        shutil.rmtree(self._directory, ignore_errors=True)
+
+
+#: Set LAMP_AUDIO_BACKEND=sounddevice to force the in-process path, or
+#: =system to insist on the subprocess one. Unset picks the best available.
+BACKEND_ENV_VAR = "LAMP_AUDIO_BACKEND"
+
+
+def SpeakerPlayer(backend: Optional[str] = None):  # noqa: N802 - kept as a name
+    """Build the best playback backend for this machine.
+
+    Prefers :class:`SystemCommandPlayer` wherever a system player exists
+    (macOS, and any Ubuntu box with pulse/alsa utils), because it is immune to
+    the GUI/GIL contention described in the module docstring. Falls back to
+    :class:`SounddevicePlayer` otherwise, so Windows and stripped-down Linux
+    installs keep working with no extra system packages.
+
+    Callable as a class was, so existing wiring and tests are unaffected.
+    """
+    choice = (backend or os.environ.get(BACKEND_ENV_VAR, "")).strip().lower()
+    if choice == "sounddevice":
+        return SounddevicePlayer()
+    if choice == "system":
+        return SystemCommandPlayer()
+    if choice:
+        raise AudioError(
+            f"{BACKEND_ENV_VAR}={choice!r} is not a known backend; "
+            "use 'system' or 'sounddevice'."
+        )
+    if find_system_player():
+        return SystemCommandPlayer()
+    return SounddevicePlayer()

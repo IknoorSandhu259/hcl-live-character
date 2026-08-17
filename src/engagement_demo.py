@@ -38,6 +38,7 @@ the character can still disengage while it is thinking about an answer.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -97,10 +98,26 @@ class TerminalTalkKey:
     ``input()``. This peeks at stdin instead and returns immediately. Kept
     behind a tiny interface (``pressed()``) so tests inject a scripted stand-in
     and never touch a real terminal.
+
+    POSIX reads the raw descriptor with ``os.read`` rather than
+    ``sys.stdin.readline()``. ``sys.stdin`` is a buffered ``TextIOWrapper``:
+    ``select`` reports on the *file descriptor* while ``readline`` reads
+    through the buffer, so the two can disagree about whether input is
+    pending, and a ``readline`` that guesses wrong blocks the whole loop.
+    Reading the descriptor directly keeps the two in step.
     """
 
     def __init__(self) -> None:
-        self.available = sys.stdin is not None and sys.stdin.isatty()
+        self.fileno = None
+        try:
+            if sys.stdin is not None and sys.stdin.isatty():
+                self.fileno = sys.stdin.fileno()
+        except (OSError, ValueError):
+            self.fileno = None  # detached or closed stdin: silently inert
+
+    @property
+    def available(self) -> bool:
+        return self.fileno is not None
 
     def pressed(self) -> bool:
         if not self.available:
@@ -113,14 +130,65 @@ class TerminalTalkKey:
                 # Drain everything buffered so a burst counts as one request.
                 hit = msvcrt.getwch() in ("\r", "\n", "t") or hit
             return hit
+
         import select  # noqa: PLC0415  (platform specific)
 
         hit = False
-        while select.select([sys.stdin], [], [], 0)[0]:
-            if not sys.stdin.readline():
+        while True:
+            try:
+                ready, _, _ = select.select([self.fileno], [], [], 0)
+                if not ready:
+                    return hit
+                chunk = os.read(self.fileno, 1024)
+            except (OSError, ValueError):
+                return hit
+            if not chunk:
                 return hit  # stdin closed
-            hit = True
-        return hit
+            # Anything the user typed and committed with Enter counts; the
+            # whole buffer is drained so a burst is one request, not several.
+            hit = hit or b"\n" in chunk or b"\r" in chunk or b"t" in chunk
+
+
+class SimulatorTalkKey:
+    """Push-to-talk from inside the PyBullet GUI window.
+
+    With the simulator on screen the window usually has keyboard focus, so
+    keystrokes never reach the terminal at all -- which is why the terminal
+    watcher alone looked dead during the macOS run. PyBullet already reports
+    the keys its own window received, so asking it is both the smallest fix and
+    the one that matches where the user is actually looking.
+
+    Inert (and harmless) in DIRECT/headless mode, where there is no window.
+    """
+
+    #: Enter, space, or 't'. Enter and space are what people try first.
+    KEYS = (p.B3G_RETURN, ord(" "), ord("t"))
+
+    def __init__(self, client_id: int):
+        self.client_id = client_id
+
+    def pressed(self) -> bool:
+        try:
+            events = p.getKeyboardEvents(physicsClientId=self.client_id)
+        except Exception:
+            return False  # no GUI, or the client went away mid-shutdown
+        return any(
+            events.get(key, 0) & p.KEY_WAS_TRIGGERED for key in self.KEYS
+        )
+
+
+class AnyTalkKey:
+    """True if any source saw a keypress this tick.
+
+    Polls every source rather than short-circuiting, so an unread terminal
+    buffer still gets drained when the GUI answered first.
+    """
+
+    def __init__(self, *sources):
+        self.sources = [source for source in sources if source is not None]
+
+    def pressed(self) -> bool:
+        return any([source.pressed() for source in self.sources])
 
 
 def build_voice_turn(lamp: LampController) -> VoiceTurn:
@@ -217,7 +285,12 @@ def run(
         voice = voice_factory(lamp) if voice_factory is not None else None
         session = VoiceSession(voice) if voice is not None else None
         if voice is not None and talk_key is None:
-            talk_key = TerminalTalkKey()
+            # Two sources, because which window has focus is not ours to
+            # decide: the terminal, and the PyBullet window when there is one.
+            talk_key = AnyTalkKey(
+                TerminalTalkKey(),
+                None if headless else SimulatorTalkKey(client),
+            )
         #: Bumped on every IDLE -> ENGAGED transition. A turn carries the value
         #: it started under, which is how a result that outlived its
         #: conversation is recognised and dropped.
@@ -227,7 +300,8 @@ def run(
         print(f"[{time.strftime('%H:%M:%S')}] ready in {tracker.state.value}; "
               "look at the camera to engage. Ctrl-C (or 'q' in the preview) to quit.")
         if voice is not None:
-            print("      while ENGAGED, press Enter (or 't' in the preview) to talk.")
+            print("      while ENGAGED, press Enter to talk -- in this terminal, "
+                  "in the lamp window, or 't' in the camera preview.")
 
         period = 1.0 / DETECT_HZ
         while True:

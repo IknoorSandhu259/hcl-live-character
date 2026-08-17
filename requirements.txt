@@ -7,6 +7,12 @@ opencv-python>=4.8,<5
 # structured output, both of which character.py calls directly. Left unpinned
 # above that: the three endpoints used here are stable across the 1.x-3.x line.
 openai>=1.66
-# Thin PortAudio binding for the laptop microphone and speaker. Needs the
-# system PortAudio library on Ubuntu: sudo apt install libportaudio2
+# Thin PortAudio binding for the laptop microphone, and the fallback playback
+# path. Needs the system PortAudio library on Ubuntu:
+#   sudo apt install libportaudio2
+# Playback prefers a separate player process where one exists (afplay on
+# macOS; paplay/aplay on Linux) because in-process PortAudio playback and the
+# PyBullet GUI contend for the GIL -- see audio_io.py. On Ubuntu 24.04 paplay
+# ships with the desktop; on a minimal install add it with:
+#   sudo apt install pulseaudio-utils   (or alsa-utils for aplay)
 sounddevice>=0.4.6

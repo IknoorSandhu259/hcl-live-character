@@ -11,6 +11,7 @@ path runs in-process against stand-ins.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 from pathlib import Path
@@ -1001,6 +1002,242 @@ def test_session_refuses_to_start_while_a_result_is_undrained():
     assert session.start(epoch=2, now=0.0) is False  # result not yet polled
     session.poll()
     assert session.start(epoch=3, now=0.0) is True
+
+
+# --------------------------------------------------------------------------
+# Playback backends
+#
+# The GUI/GIL contention these guard against is a real-time property and
+# cannot be asserted in-process; see the manual retest steps in the report.
+# What *is* testable is that the process-isolated backend is chosen where it
+# matters, that it stages and spawns correctly, and that it validates audio
+# before the robot moves.
+# --------------------------------------------------------------------------
+
+
+def test_macos_and_linux_prefer_a_separate_player_process(monkeypatch):
+    monkeypatch.setattr(audio_io.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    assert audio_io.find_system_player("darwin") == ["/usr/bin/afplay"]
+    # paplay first: it is what a stock Ubuntu 24.04 desktop actually runs.
+    assert audio_io.find_system_player("linux") == ["/usr/bin/paplay"]
+
+
+def test_linux_falls_back_to_aplay_when_pulse_is_absent(monkeypatch):
+    monkeypatch.setattr(
+        audio_io.shutil, "which", lambda name: "/usr/bin/aplay" if name == "aplay" else None
+    )
+
+    assert audio_io.find_system_player("linux") == ["/usr/bin/aplay", "-q"]
+
+
+def test_windows_has_no_system_player_and_stays_in_process(monkeypatch):
+    monkeypatch.setattr(audio_io.shutil, "which", lambda name: f"C:/bin/{name}")
+
+    assert audio_io.find_system_player("win32") is None
+
+
+def test_the_default_backend_is_the_subprocess_one_when_available(monkeypatch):
+    monkeypatch.delenv(audio_io.BACKEND_ENV_VAR, raising=False)
+    monkeypatch.setattr(audio_io, "find_system_player", lambda *_a: ["/usr/bin/afplay"])
+
+    assert isinstance(audio_io.SpeakerPlayer(), audio_io.SystemCommandPlayer)
+
+
+def test_the_backend_falls_back_in_process_with_no_system_player(monkeypatch):
+    monkeypatch.delenv(audio_io.BACKEND_ENV_VAR, raising=False)
+    monkeypatch.setattr(audio_io, "find_system_player", lambda *_a: None)
+
+    assert isinstance(audio_io.SpeakerPlayer(), audio_io.SounddevicePlayer)
+
+
+def test_the_backend_can_be_forced_from_the_environment(monkeypatch):
+    monkeypatch.setattr(audio_io, "find_system_player", lambda *_a: ["/usr/bin/afplay"])
+
+    monkeypatch.setenv(audio_io.BACKEND_ENV_VAR, "sounddevice")
+    assert isinstance(audio_io.SpeakerPlayer(), audio_io.SounddevicePlayer)
+
+    monkeypatch.setenv(audio_io.BACKEND_ENV_VAR, "system")
+    assert isinstance(audio_io.SpeakerPlayer(), audio_io.SystemCommandPlayer)
+
+    monkeypatch.setenv(audio_io.BACKEND_ENV_VAR, "esound")
+    with pytest.raises(audio_io.AudioError, match="not a known backend"):
+        audio_io.SpeakerPlayer()
+
+
+def test_system_player_stages_a_wav_and_spawns_the_binary(monkeypatch):
+    spawned = []
+    monkeypatch.setattr(audio_io.subprocess, "Popen", lambda argv, **kw: spawned.append((argv, kw)))
+    player = audio_io.SystemCommandPlayer(command=["/usr/bin/afplay"])
+
+    prepared = player.prepare(audio_io.encode_wav(b"\x00\x00" * 16_000))
+    assert prepared.path is not None and Path(prepared.path).exists()
+    assert prepared.seconds == pytest.approx(1.0)
+    assert prepared.samples is None  # nothing decoded into this process
+
+    player.play(prepared)
+    argv, kwargs = spawned[0]
+
+    assert argv == ["/usr/bin/afplay", prepared.path]
+    assert "shell" not in kwargs  # fixed argv, resolved binary, never a shell
+    player._cleanup()
+
+
+def test_system_player_validates_audio_before_the_robot_moves():
+    """Malformed audio must fail in prepare(), not inside the player process."""
+    player = audio_io.SystemCommandPlayer(command=["/usr/bin/afplay"])
+    turn, lamp, _recorder, _player = build_turn(
+        behavior="nod", player=player, audio=b"not a wav file"
+    )
+
+    with pytest.raises(TurnError, match="not a readable WAV stream"):
+        turn.run()
+
+    assert lamp.calls == []
+    player._cleanup()
+
+
+def test_system_player_reports_a_failed_spawn_without_killing_the_demo(monkeypatch):
+    def boom(*_a, **_k):
+        raise OSError("Exec format error")
+
+    monkeypatch.setattr(audio_io.subprocess, "Popen", boom)
+    player = audio_io.SystemCommandPlayer(command=["/usr/bin/afplay"])
+    turn, lamp, _recorder, _player = build_turn(behavior="nod", player=player)
+
+    with pytest.raises(TurnError, match="playback failed after the gesture"):
+        turn.run()
+
+    assert lamp.calls == ["nod"]  # past the commit point, correctly reported
+    player._cleanup()
+
+
+def test_system_player_cleans_up_the_previous_turns_file(monkeypatch):
+    monkeypatch.setattr(audio_io.subprocess, "Popen", lambda *a, **k: None)
+    player = audio_io.SystemCommandPlayer(command=["/usr/bin/afplay"])
+
+    first = player.prepare(SPEECH).path
+    second = player.prepare(SPEECH).path
+
+    assert not Path(first).exists()
+    assert Path(second).exists()
+    player._cleanup()
+    assert not Path(second).exists()
+
+
+def test_missing_system_player_is_a_clear_error(monkeypatch):
+    monkeypatch.setattr(audio_io, "find_system_player", lambda *_a: None)
+
+    with pytest.raises(audio_io.AudioError, match="no system audio player"):
+        audio_io.SystemCommandPlayer()
+
+
+# --------------------------------------------------------------------------
+# Push-to-talk sources
+# --------------------------------------------------------------------------
+
+
+class _FakeStdin:
+    def __init__(self, fd, tty=True):
+        self._fd = fd
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+    def fileno(self):
+        return self._fd
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX select/os.read path")
+def test_terminal_talk_key_sees_a_bare_newline(monkeypatch):
+    """Regression: readline() through the TextIOWrapper could miss this."""
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(read_fd))
+    key = engagement_demo.TerminalTalkKey()
+
+    assert key.available is True
+    assert key.pressed() is False  # nothing typed yet
+
+    os.write(write_fd, b"\n")
+    assert key.pressed() is True
+    assert key.pressed() is False  # drained, so one press is one request
+
+    os.write(write_fd, b"\n\n\n")
+    assert key.pressed() is True  # a burst is still a single request
+    assert key.pressed() is False
+
+    os.close(write_fd)
+    os.close(read_fd)
+
+
+def test_terminal_talk_key_is_inert_without_a_tty(monkeypatch):
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(0, tty=False))
+    key = engagement_demo.TerminalTalkKey()
+
+    assert key.available is False
+    assert key.pressed() is False
+
+
+def test_terminal_talk_key_survives_a_detached_stdin(monkeypatch):
+    class Detached:
+        def isatty(self):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(sys, "stdin", Detached())
+
+    assert engagement_demo.TerminalTalkKey().pressed() is False
+
+
+def test_simulator_talk_key_reads_the_pybullet_window(monkeypatch):
+    """With the GUI focused, keystrokes never reach the terminal at all."""
+    events = {}
+    monkeypatch.setattr(
+        engagement_demo.p, "getKeyboardEvents", lambda physicsClientId: events
+    )
+    key = engagement_demo.SimulatorTalkKey(client_id=0)
+
+    assert key.pressed() is False
+
+    events[engagement_demo.p.B3G_RETURN] = engagement_demo.p.KEY_WAS_TRIGGERED
+    assert key.pressed() is True
+
+    events.clear()
+    events[ord(" ")] = engagement_demo.p.KEY_WAS_TRIGGERED
+    assert key.pressed() is True
+
+    # A key merely held down from a previous frame is not a new request.
+    events.clear()
+    events[ord("t")] = engagement_demo.p.KEY_IS_DOWN
+    assert key.pressed() is False
+
+
+def test_simulator_talk_key_is_inert_without_a_gui(monkeypatch):
+    def no_gui(**_kwargs):
+        raise Exception("Not connected to a GUI server")
+
+    monkeypatch.setattr(engagement_demo.p, "getKeyboardEvents", no_gui)
+
+    assert engagement_demo.SimulatorTalkKey(client_id=0).pressed() is False
+
+
+def test_any_talk_key_polls_every_source():
+    class Source:
+        def __init__(self, value):
+            self.value = value
+            self.polls = 0
+
+        def pressed(self):
+            self.polls += 1
+            return self.value
+
+    first, second = Source(True), Source(False)
+    combined = engagement_demo.AnyTalkKey(first, None, second)
+
+    assert combined.pressed() is True
+    # Not short-circuited: the terminal buffer must still be drained.
+    assert (first.polls, second.polls) == (1, 1)
+    assert engagement_demo.AnyTalkKey(Source(False), Source(False)).pressed() is False
 
 
 def test_the_worker_half_of_a_turn_never_touches_the_robot():
