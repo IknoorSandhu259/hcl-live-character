@@ -311,6 +311,45 @@ def test_engage_produces_exactly_one_engage():
     assert lamp.calls == ["engage"]
 
 
+def test_the_prompt_makes_gestures_sparse_and_none_the_default():
+    """Hardware testing showed nearly every turn coming back as 'nod'.
+
+    The fix is prompt guidance, so guard the guidance: these are the clauses
+    that hold the gesture rate down, and losing any of them silently would put
+    the twitchy behaviour straight back.
+    """
+    prompt = character.SYSTEM_PROMPT.lower()
+
+    # 'none' is stated as the default and as the fallback under uncertainty.
+    assert "the default is 'none'" in prompt
+    assert "if you are unsure, choose 'none'" in prompt
+    # The two gestures are gated on explicit conditions, not on politeness.
+    assert "only when" in prompt
+    assert "explicitly asks" in prompt
+    # The cases that were over-triggering are named as 'none' cases.
+    for ordinary in ("greetings", "small talk", "thanks", "acknowledging"):
+        assert ordinary in prompt
+
+
+def test_the_behavior_schema_repeats_the_sparse_gesture_policy():
+    """The schema description is prompt surface too; keep the two in step."""
+    description = character.RESPONSE_SCHEMA["properties"]["behavior"]["description"].lower()
+
+    assert "defaults to 'none'" in description
+    assert "explicit request" in description
+
+
+def test_the_prompt_change_did_not_touch_the_action_contract():
+    """Guidance only: the enum and the dispatch table are unchanged."""
+    assert character.ALLOWED_BEHAVIORS == ("none", "nod", "engage")
+    assert character.RESPONSE_SCHEMA["properties"]["behavior"]["enum"] == [
+        "none",
+        "nod",
+        "engage",
+    ]
+    assert set(BEHAVIORS) == set(character.ALLOWED_BEHAVIORS)
+
+
 def test_dispatch_table_matches_the_contract_exactly():
     assert set(BEHAVIORS) == set(ALLOWED_BEHAVIORS) == {"none", "nod", "engage"}
 
