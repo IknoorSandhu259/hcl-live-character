@@ -558,17 +558,23 @@ def _handle_goal(
 
     if outcome.stage == STAGE_VERIFY:
         if not sighting.verified:
-            _log(f"second look: {sighting.summary()} -- leaving the light off")
+            # Gone, unsure, or still visible but off to one side -- which is
+            # what a target moved during the turn looks like. One orientation
+            # attempt is all this milestone makes; there is no second try.
+            _log(
+                f"second look: {sighting.summary()} -- not centred under the head, "
+                "leaving the light off"
+            )
             _fail_goal(
                 goals, lamp, goals_module.lost_line(outcome.target), "verification failed"
             )
             return
-        # Two independent looks, the second one taken after the head moved,
-        # both confident. Only now.
+        # Two independent looks, the second one after the head moved, both
+        # confident, and the target centred in the new frame. Only now.
         if not _physical("turning the light on", lamp.light_on):
             _abandon_goal(goals, lamp, "the light would not come on")
             return
-        _log(f"light ON: {outcome.target} confirmed on a second, fresh frame")
+        _log(f"light ON: {outcome.target} centred on a second, fresh frame")
         if not goals.hold(goals_module.found_line(outcome.target)):
             # The goal is physically complete; only the sentence is lost. Leave
             # the light on -- it is the intended successful final state -- but

@@ -232,8 +232,12 @@ def test_a_well_formed_sighting_becomes_a_record():
     assert sighting.found is True
     assert sighting.location == "left"
     assert sighting.confident is True
+    # Good enough to turn towards...
     assert sighting.actionable is True
-    assert sighting.verified is True
+    # ...and deliberately not good enough to light: the light only comes on for
+    # a target the turn actually centred. See section 12.
+    assert sighting.verified is False
+    assert parse_sighting(sighting_json(location="center")).verified is True
 
 
 @pytest.mark.parametrize("location", LOCATIONS)
@@ -1861,6 +1865,149 @@ def test_disengaging_during_the_closing_speech_still_puts_the_light_out(capsys):
 
     assert session.active is False
     assert lamp.light is False
+
+
+# --------------------------------------------------------------------------
+# 12. The second look must confirm the turn actually worked
+# --------------------------------------------------------------------------
+#
+# "Find my water bottle and shine your light ON IT". Hardware testing moved the
+# bottle across the desk while the head was turning: the second look still said
+# found+confident, and the lamp lit an empty patch of desk. Being visible
+# somewhere is not the same as being under the light.
+
+
+def test_alignment_is_a_member_of_the_existing_location_enum():
+    """No new tolerance concept: it is one of the four words we already had."""
+    assert goal_module.ALIGNED_LOCATION == "center"
+    assert goal_module.ALIGNED_LOCATION in LOCATIONS
+    assert goal_module.ALIGNED_LOCATION in ORIENTATIONS
+
+
+@pytest.mark.parametrize(
+    "second, expected",
+    [
+        ({"found": True, "location": "center", "confident": True}, True),
+        ({"found": True, "location": "left", "confident": True}, False),
+        ({"found": True, "location": "right", "confident": True}, False),
+        ({"found": True, "location": "unknown", "confident": True}, False),
+        ({"found": True, "location": "center", "confident": False}, False),
+        ({"found": False, "location": "center", "confident": True}, False),
+    ],
+    ids=["centred", "drifted-left", "drifted-right", "unknown", "unsure", "gone"],
+)
+def test_only_a_centred_sighting_is_verified(second, expected):
+    assert parse_sighting(json.dumps(second)).verified is expected
+
+
+def _run_two_look_goal(monkeypatch, first, second):
+    """Drive the whole loop with a scripted first and second sighting."""
+    brain = _LocatingBrain(json.dumps(first), json.dumps(second))
+    log, player = _run_goal_demo(monkeypatch, brain)
+    return brain, log, player
+
+
+@pytest.mark.parametrize(
+    "first, turn",
+    [
+        ({"found": True, "location": "left", "confident": True}, "look_left"),
+        ({"found": True, "location": "right", "confident": True}, "look_right"),
+    ],
+    ids=["from-the-left", "from-the-right"],
+)
+def test_a_target_centred_by_the_turn_lights_up(monkeypatch, capsys, first, turn):
+    brain, log, player = _run_two_look_goal(
+        monkeypatch, first, {"found": True, "location": "center", "confident": True}
+    )
+    out = capsys.readouterr().out
+
+    assert len(brain.calls) == 2
+    assert [entry for entry in log if entry in (turn, "light_on")] == [turn, "light_on"]
+    assert "centred on a second, fresh frame" in out
+    assert brain.spoken == [goal_module.found_line("mug")]
+    assert player.played == [b"speech"]
+
+
+@pytest.mark.parametrize(
+    "first, turn, second_location",
+    [
+        # Turned left, but the bottle was moved to the other side meanwhile.
+        ({"found": True, "location": "left", "confident": True}, "look_left", "right"),
+        # ...and the mirror image.
+        ({"found": True, "location": "right", "confident": True}, "look_right", "left"),
+        # Still visible, but the model cannot say where any more.
+        ({"found": True, "location": "left", "confident": True}, "look_left", "unknown"),
+    ],
+    ids=["moved-to-the-right", "moved-to-the-left", "position-lost"],
+)
+def test_a_target_that_moved_during_the_turn_does_not_light_up(
+    monkeypatch, capsys, first, turn, second_location
+):
+    """found + confident is no longer enough; it has to be under the head."""
+    brain, log, player = _run_two_look_goal(
+        monkeypatch,
+        first,
+        {"found": True, "location": second_location, "confident": True},
+    )
+    out = capsys.readouterr().out
+
+    assert len(brain.calls) == 2          # it did look again...
+    assert turn in log                    # ...and it did turn...
+    assert "light_on" not in log          # ...but the light stayed off.
+    assert "not centred under the head" in out
+    assert brain.spoken == [goal_module.lost_line("mug")]
+    assert player.played == [b"speech"]
+
+
+def test_a_failed_alignment_ends_the_goal_cleanly(monkeypatch, capsys):
+    """No stuck goal, no light, and only one orientation attempt."""
+    brain = _LocatingBrain(
+        sighting_json(location="left"),
+        sighting_json(location="right"),
+    )
+    log = _spy_lamp(monkeypatch)
+    player = _GoalPlayer()
+    goals = _inline_goal_session(brain, player)
+    turn = GoalTurn()
+
+    engagement_demo.run(
+        preview=False,
+        headless=True,
+        sensor=_FrameSensor([(True, 8.0)]),
+        voice_factory=lambda _lamp: turn,
+        talk_key=ScriptedTalkKey(40),
+        goals=goals,
+        player=player,
+    )
+    capsys.readouterr()
+
+    assert goals.active is False
+    assert goals.occupied is False
+    assert log.count("look_left") == 1     # exactly one orientation attempt
+    assert "look_right" not in log         # ...and no corrective second try
+    assert "light_on" not in log
+    assert log[-1] == "light_off"
+
+
+def test_a_non_centred_second_look_is_reported_at_the_handler(capsys):
+    brain = _LocatingBrain(sighting_json(location="left"), sighting_json(location="right"))
+    session = _inline_goal_session(brain)
+    lamp = GoalLamp()
+    session.request(MUG, 1)
+    session.supply_frame(b"frame-one")
+    engagement_demo._handle_goal(
+        session.poll(), session, lamp, _GoalPlayer(), _NoFlush(), _Engaged(), 1
+    )
+    session.supply_frame(b"frame-two")
+    engagement_demo._handle_goal(
+        session.poll(), session, lamp, _GoalPlayer(), _NoFlush(), _Engaged(), 1
+    )
+    capsys.readouterr()
+
+    assert lamp.light is False
+    assert "light_on" not in lamp.calls
+    assert session.held is True            # the failure line is queued, not lost
+    assert session.line == goal_module.lost_line("mug")
 
 
 def test_the_voice_turn_still_has_no_route_to_a_camera():

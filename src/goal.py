@@ -167,6 +167,12 @@ def parse_goal(payload: object) -> Goal:
 
 SIGHTING_FIELDS = ("found", "location", "confident")
 
+#: Where the target has to be on the *second* look for the goal to complete.
+#: A member of the existing location enum, not a new tolerance concept: the
+#: head is pointing at the middle of the frame, so "centre" is the coarse
+#: schema's own way of saying "the light is on it".
+ALIGNED_LOCATION = "center"
+
 
 @dataclass(frozen=True)
 class TargetSighting:
@@ -192,10 +198,22 @@ class TargetSighting:
     def verified(self) -> bool:
         """True only if this sighting may cause the light to come on.
 
-        The second look does not need a position -- the head is already
-        pointing -- so it is the plain "still there, and I am sure" test.
+        "Still there somewhere" is not what the goal promised. The person asked
+        for the light to be *on* the object, so the second look has to confirm
+        the orientation actually worked: the target must be in the middle third
+        of the frame, which is where the head is now pointing.
+
+        This is what catches an object that moved during the turn. Hardware
+        testing found a bottle picked up mid-gesture and put down on the other
+        side of the desk: it was still found, still confidently placed, and the
+        lamp lit an empty patch of desk. A sighting of ``left`` or ``right``
+        after the turn now means the goal failed.
+
+        One turn, then a strict check. Nothing here re-aims: a second corrective
+        gesture would need the tracking and tolerance machinery this milestone
+        deliberately does not have.
         """
-        return self.found and self.confident
+        return self.found and self.confident and self.location == ALIGNED_LOCATION
 
     def summary(self) -> str:
         if not self.found:
@@ -263,6 +281,13 @@ if set(ORIENTATIONS) | {"unknown"} != set(LOCATIONS):
         f"contract {sorted(LOCATIONS)}"
     )
 
+if ALIGNED_LOCATION not in ORIENTATIONS:
+    # The location the second look must report is the one the head ends up
+    # facing, so it has to be a real member of the same enum.
+    raise RuntimeError(
+        f"{ALIGNED_LOCATION!r} is not one of the orientations {sorted(ORIENTATIONS)}"
+    )
+
 
 # --------------------------------------------------------------------------
 # What the character says about it
@@ -278,7 +303,9 @@ def found_line(target: str) -> str:
 
 
 def lost_line(target: str) -> str:
-    return f"I had your {target}, but I lost sight of it when I turned. I'll leave my light off."
+    # Covers both ways the second look can fail: the target is gone, or it is
+    # still there but no longer where my light is pointing.
+    return f"I turned, but I can't get my light onto your {target}. I'll leave it off."
 
 
 def missing_line(target: str) -> str:
