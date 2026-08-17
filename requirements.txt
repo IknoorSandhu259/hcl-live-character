@@ -2,3 +2,11 @@ pybullet>=3.2.5
 # 4.x line only: OpenCV 5 removed the Haar cascade API (cv2.CascadeClassifier)
 # and the bundled haarcascade_*.xml data that the attention proxy relies on.
 opencv-python>=4.8,<5
+# Speech-to-text, character reasoning and text-to-speech (official SDK).
+# >=1.66 is the floor for the Responses API and its `text.format` json_schema
+# structured output, both of which character.py calls directly. Left unpinned
+# above that: the three endpoints used here are stable across the 1.x-3.x line.
+openai>=1.66
+# Thin PortAudio binding for the laptop microphone and speaker. Needs the
+# system PortAudio library on Ubuntu: sudo apt install libportaudio2
+sounddevice>=0.4.6
