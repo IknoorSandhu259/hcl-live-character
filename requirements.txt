@@ -11,8 +11,11 @@ openai>=1.66
 # path. Needs the system PortAudio library on Ubuntu:
 #   sudo apt install libportaudio2
 # Playback prefers a separate player process where one exists (afplay on
-# macOS; paplay/aplay on Linux) because in-process PortAudio playback and the
-# PyBullet GUI contend for the GIL -- see audio_io.py. On Ubuntu 24.04 paplay
-# ships with the desktop; on a minimal install add it with:
+# macOS; paplay then aplay on Linux) because in-process PortAudio playback and
+# the PyBullet GUI contend for the GIL -- see audio_io.py. Rather than depend on
+# what a given Ubuntu image happens to ship, the documented setup in README.md
+# installs paplay explicitly:
 #   sudo apt install pulseaudio-utils   (or alsa-utils for aplay)
+# With neither player present the code falls back to in-process PortAudio; that
+# path is untested on Ubuntu 24.04 hardware.
 sounddevice>=0.4.6

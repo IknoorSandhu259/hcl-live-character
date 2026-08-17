@@ -334,9 +334,23 @@ def build_voice_turn(
     )
 
 
+def _timestamp() -> str:
+    """Wall-clock stamp with milliseconds, e.g. ``14:03:27.412``.
+
+    Milliseconds rather than whole seconds purely so the run log is usable as
+    measurement evidence: response latency is read off the gap between the
+    "listening..." line and the "said:" line of the same turn, and that gap is
+    only a few seconds long. At one-second resolution the rounding either side
+    is a large fraction of the quantity being reported. Nothing reads this
+    string but a human -- it changes no timing, no ordering and no behaviour.
+    """
+    now = time.time()
+    return f"{time.strftime('%H:%M:%S', time.localtime(now))}.{int(now % 1 * 1000):03d}"
+
+
 def _log(message: str, error: bool = False) -> None:
     stream = sys.stderr if error else sys.stdout
-    print(f"[{time.strftime('%H:%M:%S')}] {message}", file=stream, flush=True)
+    print(f"[{_timestamp()}] {message}", file=stream, flush=True)
 
 
 def _handle_outcome(
@@ -736,7 +750,7 @@ def run(
         epoch = 0
 
         lamp.neutral()
-        print(f"[{time.strftime('%H:%M:%S')}] ready in {tracker.state.value}; "
+        print(f"[{_timestamp()}] ready in {tracker.state.value}; "
               "look at the camera to engage. Ctrl-C (or 'q' in the preview) to quit.")
         if voice is not None:
             print("      while ENGAGED, press Enter to talk -- in this terminal, "
@@ -775,7 +789,7 @@ def run(
 
             if transition is EngagementState.ENGAGED:
                 epoch += 1
-                print(f"[{time.strftime('%H:%M:%S')}] IDLE -> ENGAGED")
+                print(f"[{_timestamp()}] IDLE -> ENGAGED")
                 lamp.engage()
                 # Motion and sound together: the character notices you with its
                 # body and its voice box at the same moment. Deliberately after
@@ -790,7 +804,7 @@ def run(
                     )
                 sensor.flush()
             elif transition is EngagementState.IDLE:
-                print(f"[{time.strftime('%H:%M:%S')}] ENGAGED -> IDLE")
+                print(f"[{_timestamp()}] ENGAGED -> IDLE")
                 # Settling back down puts the light out with the pose: the
                 # light is only ever on because a goal completed for someone
                 # who is standing here, and they are not any more.
