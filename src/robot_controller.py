@@ -52,6 +52,17 @@ ACTUATED_JOINTS = (
 #: PyBullet gives each of them a default 1 kg. See _zero_semantic_frame_masses.
 SEMANTIC_FRAME_LINKS = ("light_emitter_link", "camera_link", "speaker_link")
 
+#: The URDF's semantic marker for the bulb. It has a visual shape but no
+#: simulated emission -- PyBullet has no light sources -- so "the light is on"
+#: is rendered by recolouring that shape. That is a deliberate floor: a visible
+#: on/off state is what the demo needs, and lighting physics is not.
+LIGHT_LINK = "light_emitter_link"
+
+#: Bright warm bulb vs. a dull unlit one. Both fully opaque so the change reads
+#: at a glance from the demo's default camera.
+LIGHT_ON_RGBA = (1.0, 0.93, 0.55, 1.0)
+LIGHT_OFF_RGBA = (0.32, 0.32, 0.30, 1.0)
+
 #: Simulation step. 240 Hz is PyBullet's default and keeps the position
 #: controller stable at these gains.
 TIME_STEP = 1.0 / 240.0
@@ -212,6 +223,12 @@ class LampController:
         self._targets: Dict[str, float] = {
             name: spec.clamp(self._measured_position(spec)) for name, spec in self.joints.items()
         }
+        self._light_index = self._discover_light_link()
+        self._light_on = False
+        # Start from a known, safe, dark state rather than whatever colour the
+        # URDF happened to declare, so "the light is on" always means the demo
+        # turned it on.
+        self.light_off()
         if realtime is None:
             info = p.getConnectionInfo(physicsClientId=client_id)
             realtime = info.get("connectionMethod") == p.GUI
@@ -259,6 +276,27 @@ class LampController:
             raise ValueError(f"URDF is missing expected actuated joints: {missing}")
         # Preserve the declared order for readable logging.
         return {name: found[name] for name in ACTUATED_JOINTS}
+
+    def _discover_light_link(self) -> int:
+        """Find the bulb by *name*, the same way the joints are found.
+
+        Requires exactly one match. Zero means the model is not the one this
+        code was written for; two or more means "the light" is ambiguous, and
+        silently picking the first would leave half the fixture lit while the
+        state we report says it is on. Both fail closed.
+        """
+        matches = []
+        for index in range(p.getNumJoints(self.body_id, physicsClientId=self.client_id)):
+            info = p.getJointInfo(self.body_id, index, physicsClientId=self.client_id)
+            if info[12].decode() == LIGHT_LINK:
+                matches.append(index)
+        if len(matches) != 1:
+            raise ValueError(
+                f"expected exactly one '{LIGHT_LINK}' in the URDF, found "
+                f"{len(matches)} (link indices {matches}); refusing to guess "
+                "which one is the light"
+            )
+        return matches[0]
 
     def _measured_position(self, spec: JointSpec) -> float:
         return p.getJointState(self.body_id, spec.index, physicsClientId=self.client_id)[0]
@@ -377,6 +415,35 @@ class LampController:
             self.move_to_pose({"head_pitch_joint": base + amplitude}, 0.28)
             self.move_to_pose({"head_pitch_joint": base - amplitude * 0.4}, 0.28)
         self.move_to_pose({"head_pitch_joint": base}, 0.25)
+
+    # -- the light ---------------------------------------------------------
+    #
+    # Two argument-free calls, owned here for the same reason every gesture is:
+    # this layer is the only one allowed to touch the simulated body. Higher
+    # layers ask for "on" or "off" and cannot ask for anything else -- there is
+    # no colour, intensity or link name in the API to pass.
+
+    @property
+    def light_is_on(self) -> bool:
+        """Whether the bulb is currently lit. The demo's completion evidence."""
+        return self._light_on
+
+    def light_on(self) -> None:
+        """Light the bulb."""
+        self._set_light(True)
+
+    def light_off(self) -> None:
+        """Put the bulb out. The safe state, used at startup and at shutdown."""
+        self._set_light(False)
+
+    def _set_light(self, on: bool) -> None:
+        p.changeVisualShape(
+            self.body_id,
+            self._light_index,
+            rgbaColor=list(LIGHT_ON_RGBA if on else LIGHT_OFF_RGBA),
+            physicsClientId=self.client_id,
+        )
+        self._light_on = bool(on)
 
 
 def _smoothstep(t: float) -> float:

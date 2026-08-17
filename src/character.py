@@ -18,16 +18,25 @@ Structured output is requested from the Responses API, but the result is still
 validated locally (:func:`parse_character_reply`). Model-side schema
 enforcement is a convenience, not a trust boundary.
 
-Two kinds of call, and only one of them carries a picture
----------------------------------------------------------
-:meth:`CharacterBrain.observe` is the *only* method in the system that sends an
-image. It happens once, when the person asks the character to look, and its
+Which calls carry a picture, and which do not
+---------------------------------------------
+:meth:`CharacterBrain.observe` and :meth:`CharacterBrain.locate` are the only
+methods in the system that send an image, and they answer different questions.
+``observe`` happens once, when the person asks the character to look, and its
 whole output is a five-field record that ``scene_memory`` validates and stores.
+``locate`` asks about one *named* target -- "is the mug here, and on which
+side?" -- and its three-field answer is never stored: it is fresh evidence for
+one goal, used twice within that goal and then discarded.
 
 :meth:`CharacterBrain.respond` answers a spoken question and takes the retained
 facts as *text*. It has no image parameter and no camera access, so a question
 about the mug is answered from the note, never by looking again -- which is
 what makes the answer survive the mug being moved or taken away.
+
+The turn's response also carries a ``goal``: either nothing, or the single
+``find_and_light(target)`` job. That is a separate contract from ``behavior``,
+validated by ``goal.parse_goal``, and it is a *request* -- the robot does not
+move for it until fresh perception says where to move.
 """
 
 from __future__ import annotations
@@ -40,6 +49,17 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from goal import (
+    GOAL_KINDS,
+    MAX_TARGET_CHARS,
+    NO_GOAL,
+    Goal,
+    GoalError,
+    TargetSighting,
+    normalize_target,
+    parse_goal,
+    parse_sighting,
+)
 from scene_memory import (
     LOCATIONS,
     MAX_COLOR_CHARS,
@@ -134,7 +154,46 @@ SYSTEM_PROMPT = (
     "If the note is absent, or does not contain what they asked for, say plainly that "
     "you did not note that -- never guess a colour, a position or a detail, and never "
     "claim to be looking at something right now."
+    "\n\n"
+    "Finally, and entirely separately from 'behavior', set the 'goal' field. There is "
+    "exactly one job you can take on: finding a named object in front of you right now and "
+    "shining your light on it. Set kind to 'find_and_light' with the object as 'target' ONLY "
+    "when the person clearly asks you to find, point at, light up or shine your light on one "
+    "specific everyday object -- 'find my mug and shine your light on it'. The target must be "
+    "the plain lowercase noun for that object ('mug', 'water bottle'): never a person, never a "
+    "place, never an instruction, never a sentence. In every other case set kind to 'none' and "
+    "target to an empty string; a question about something you looked at earlier is recall, "
+    "not a goal, and is answered from your note. A goal does not replace your reply: still say "
+    "your one or two sentences, and phrase them as something you are about to do ('let me have "
+    "a look'), because you have not looked yet."
 )
+
+#: The goal-directed action contract, kept structurally apart from the
+#: conversational one above. Two fields, one of which is an enum of two words:
+#: there is no room in it for a gesture, a joint, an angle or a sequence, and a
+#: second action would mean editing ``goal.GOAL_KINDS`` by hand.
+GOAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": list(GOAL_KINDS),
+            "description": (
+                "'find_and_light' only when the person asks you to find a specific "
+                "object in front of you now and shine your light on it. Otherwise 'none'."
+            ),
+        },
+        "target": {
+            "type": "string",
+            "description": (
+                "The plain lowercase noun for that object, at most "
+                f"{MAX_TARGET_CHARS} characters. Empty string when kind is 'none'."
+            ),
+        },
+    },
+    "required": ["kind", "target"],
+    "additionalProperties": False,
+}
 
 RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -153,18 +212,28 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                 "'engage' only when the person is asking for your attention itself."
             ),
         },
+        "goal": GOAL_SCHEMA,
     },
-    "required": ["reply", "behavior"],
+    "required": ["reply", "behavior", "goal"],
     "additionalProperties": False,
 }
 
 
 @dataclass(frozen=True)
 class CharacterReply:
-    """A validated turn: what to say, and the single gesture to play."""
+    """A validated turn: what to say, the single gesture, and any goal.
+
+    ``behavior`` and ``goal`` are two separate contracts that happen to travel
+    together. The gesture is ordinary conversational punctuation and is played
+    immediately; the goal is a request to go and do something with the light,
+    and nothing about it reaches the robot until fresh perception says it may.
+    """
 
     reply: str
     behavior: str
+    #: Defaults to no goal, so a response without the field -- an older one, or
+    #: any of the goal-free tests -- is an ordinary turn rather than an error.
+    goal: Goal = NO_GOAL
 
 
 # --------------------------------------------------------------------------
@@ -239,6 +308,73 @@ MAX_OBSERVATION_TOKENS = 200
 
 
 # --------------------------------------------------------------------------
+# The target lookup contract
+# --------------------------------------------------------------------------
+#
+# A sibling of the observation above, and deliberately not a replacement for
+# it. OBSERVE_PROMPT asks "what is the most obvious thing here?", which is the
+# wrong question for "find my mug": the most obvious thing may not be the mug.
+# This one asks about one named object and answers in three fields.
+#
+# Hour 4's observation path is untouched: different prompt, different schema,
+# different parser, different memory (none -- a sighting is never stored).
+
+LOCATE_PROMPT = (
+    "You are the eye of a small desk lamp robot. You are shown ONE frame from its "
+    "camera, looking out across the desk in front of it, and the name of ONE thing the "
+    "robot has been asked to find. Nothing else in the frame matters.\n"
+    "Answer only about that named target:\n"
+    "  found     - true only if that specific object is actually visible in this frame. "
+    "Do not accept a different object that is merely similar, and do not count a picture "
+    "of one.\n"
+    "  location  - 'left', 'center' or 'right', meaning which third of the frame the "
+    "target is in. Use 'unknown' if you cannot tell, and whenever found is false.\n"
+    "  confident - true only if you are sure of both answers. If the frame is dark, "
+    "blurred or cluttered, or the target is only barely visible, answer false.\n"
+    "The robot will turn its head and shine a light based on this answer, so a confident "
+    "wrong answer is worse than an honest 'not found'. When in doubt, answer found=false, "
+    "location='unknown', confident=false."
+)
+
+#: What the lookup call is asked, alongside the image and the target noun.
+LOCATE_REQUEST = "Look at this frame and tell me whether you can see this thing, and where."
+
+SIGHTING_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "found": {
+            "type": "boolean",
+            "description": "True only if the named target itself is visible in this frame.",
+        },
+        "location": {
+            "type": "string",
+            "enum": list(LOCATIONS),
+            "description": (
+                "Which third of the frame the target is in. 'unknown' when it is not "
+                "visible or its side cannot be told."
+            ),
+        },
+        "confident": {
+            "type": "boolean",
+            "description": (
+                "True only if both other answers are sure. False means the robot will "
+                "not move and will not light anything."
+            ),
+        },
+    },
+    "required": ["found", "location", "confident"],
+    "additionalProperties": False,
+}
+
+#: Three short fields; the cap is a backstop, not the control.
+MAX_SIGHTING_TOKENS = 100
+
+#: Same budget as an observation -- it is the same kind of call with a picture
+#: in it, and it happens twice inside one goal.
+LOCATE_TIMEOUT_SECONDS = OBSERVE_TIMEOUT_SECONDS
+
+
+# --------------------------------------------------------------------------
 # Errors
 # --------------------------------------------------------------------------
 
@@ -293,7 +429,7 @@ def parse_character_reply(raw: str) -> CharacterReply:
     if not isinstance(payload, dict):
         raise CharacterError("character response was not a JSON object")
 
-    unexpected = set(payload) - {"reply", "behavior"}
+    unexpected = set(payload) - {"reply", "behavior", "goal"}
     if unexpected:
         raise CharacterError(f"character response has unexpected fields: {sorted(unexpected)}")
 
@@ -311,7 +447,15 @@ def parse_character_reply(raw: str) -> CharacterReply:
             f"character response requested unknown behavior {behavior!r}; "
             f"allowed: {list(ALLOWED_BEHAVIORS)}"
         )
-    return CharacterReply(reply=reply.strip(), behavior=behavior)
+    # The goal is validated by `goal.parse_goal`, which owns the two-word kind
+    # enum and the bounded noun. A malformed goal fails the whole turn rather
+    # than being dropped: "I could not read what you asked me to do" must not
+    # quietly become "you asked me to do nothing".
+    try:
+        requested = parse_goal(payload.get("goal"))
+    except GoalError as exc:
+        raise CharacterError(f"character response carried an unusable goal: {exc}") from exc
+    return CharacterReply(reply=reply.strip(), behavior=behavior, goal=requested)
 
 
 # --------------------------------------------------------------------------
@@ -452,6 +596,71 @@ class CharacterBrain:
             raise CharacterError("the observation response was empty")
         # Validated locally regardless of the schema request above.
         return parse_observation(raw)
+
+    def locate(self, jpeg_bytes: bytes, target: str) -> TargetSighting:
+        """Look at one frame for one named *target* and report three fields.
+
+        The sibling of :meth:`observe`, for the one case that record cannot
+        serve: "is the thing they asked about in front of me *now*?". Called
+        twice in a goal -- once to decide which way to turn, once after turning
+        to decide whether the light may come on -- and each call gets its own
+        freshly captured frame.
+
+        *target* is re-validated here, immediately before it is written into a
+        prompt, even though the spoken turn already validated it. It is a noun
+        and nothing else: it is not an action, not a parameter, and it never
+        reaches the robot.
+
+        Raises :class:`CharacterError` if the call failed or the target was not
+        bounded semantic text, and :class:`goal.GoalError` if the response was
+        unusable. Either way the caller neither moves nor lights.
+        """
+        if not jpeg_bytes:
+            raise CharacterError("no camera frame to look at")
+        try:
+            subject = normalize_target(target)
+        except GoalError as exc:
+            raise CharacterError(f"refusing to look for an unbounded target: {exc}") from exc
+
+        encoded = base64.b64encode(jpeg_bytes).decode("ascii")
+        try:
+            response = self._client.responses.create(
+                model=VISION_MODEL,
+                instructions=LOCATE_PROMPT,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": f"{LOCATE_REQUEST}\nThe target is: {subject}",
+                            },
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/jpeg;base64,{encoded}",
+                            },
+                        ],
+                    }
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "target_sighting",
+                        "strict": True,
+                        "schema": SIGHTING_SCHEMA,
+                    }
+                },
+                max_output_tokens=MAX_SIGHTING_TOKENS,
+                timeout=LOCATE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            raise CharacterError(f"looking for the {subject} failed: {_safe(exc)}") from exc
+
+        raw = getattr(response, "output_text", None)
+        if not isinstance(raw, str) or not raw.strip():
+            raise CharacterError("the target lookup response was empty")
+        # Validated locally regardless of the schema request above.
+        return parse_sighting(raw)
 
     # -- stage 3: speaking -------------------------------------------------
 

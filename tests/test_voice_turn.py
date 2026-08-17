@@ -757,8 +757,12 @@ class ScriptedSensor:
         self._index += 1
         return self._reading(attending=attending, faces=(), frame=None)
 
-    def flush(self) -> None:
+    def flush(self) -> bool:
+        # True = "the acquisition boundary was established", which is what the
+        # real AttentionSensor.flush answers. A scripted sensor has no driver
+        # queue, so every frame it hands out is already post-boundary.
         self.flushes += 1
+        return True
 
     def close(self) -> None:
         pass

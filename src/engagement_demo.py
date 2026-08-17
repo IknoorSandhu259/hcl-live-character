@@ -21,6 +21,13 @@ memory and printed. A later spoken question is answered from that record --
 the recall path has no camera in it at all, so the answer survives the object
 being moved or taken away.
 
+And while ENGAGED, ask out loud for the one goal the character can act on --
+"find my mug and shine your light on it". That is not recall: it takes a fresh
+frame, looks for that specific object, turns towards the side it is on with a
+named gesture, takes a SECOND fresh frame after turning, and only lights the
+bulb if the object is still confidently there. Anything less and the light
+stays off and the character says so.
+
 This file is the *wiring* only, and is deliberately thin:
 
     attention.AttentionSensor      camera -> "is a face facing us?"  (perception)
@@ -33,7 +40,11 @@ This file is the *wiring* only, and is deliberately thin:
     scene_memory.ObservationSession  the vision call, off this thread
     voice_turn.VoiceTurn           one turn, and the action allowlist
     voice_turn.VoiceSession        the slow half of a turn, off this thread
+    goal.parse_goal                "none" or find_and_light(target)
+    goal.ORIENTATIONS              left/center/right -> a named gesture
+    goal.GoalSession               the two vision calls, off this thread
     robot_controller.LampController   IDLE / ENGAGED / gesture -> motion (body)
+                                   light_on / light_off
 
 Perception and language never issue a joint command, and the body layer never
 sees a pixel or a token. Every joint command still goes through
@@ -74,6 +85,14 @@ from character import (  # noqa: E402
     CharacterError,
     MissingCredentialsError,
     require_api_key,
+)
+import goal as goals_module  # noqa: E402
+from goal import (  # noqa: E402
+    ORIENTATIONS,
+    STAGE_LOCATE,
+    STAGE_SPEAK,
+    STAGE_VERIFY,
+    GoalSession,
 )
 from robot_controller import LampController, load_lamp  # noqa: E402
 from scene_memory import ObservationSession, SceneMemory  # noqa: E402
@@ -291,17 +310,19 @@ def build_voice_turn(
     lamp: LampController,
     memory: Optional[SceneMemory] = None,
     brain: Optional[CharacterBrain] = None,
+    player=None,
 ) -> VoiceTurn:
     """Default wiring of the spoken path onto a live lamp.
 
     *brain* is shared with the observation path when there is one, so the
     process holds a single OpenAI client. *memory* is the same object the
-    observation path writes to; the turn only reads it.
+    observation path writes to; the turn only reads it. *player* is shared with
+    the goal path, so one speaker is opened rather than two.
     """
     return VoiceTurn(
         brain=brain if brain is not None else CharacterBrain(),
         recorder=MicrophoneRecorder(),
-        player=SpeakerPlayer(),
+        player=player if player is not None else SpeakerPlayer(),
         lamp=lamp,
         memory=memory,
     )
@@ -312,7 +333,9 @@ def _log(message: str, error: bool = False) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", file=stream, flush=True)
 
 
-def _handle_outcome(outcome, session, voice, sensor, tracker, epoch: int) -> None:
+def _handle_outcome(
+    outcome, session, voice, sensor, tracker, epoch: int, goals=None, lamp=None
+) -> None:
     """Apply one finished turn on the control thread. Reports, never raises.
 
     This is the only place robot motion can result from something the model
@@ -341,6 +364,26 @@ def _handle_outcome(outcome, session, voice, sensor, tracker, epoch: int) -> Non
     session.mark_speaking(result.speech_seconds, time.monotonic())
     _log(f'heard: "{result.transcript}"')
     _log(f'said:  "{result.reply}"  behavior={result.behavior}')
+
+    # A goal is accepted here and executed nowhere near here: `request` only
+    # records that one is wanted. The loop below hands it a camera frame on a
+    # later tick, and every motion it causes happens on this thread.
+    if result.goal.is_action:
+        if goals is None:
+            _log(f"I can't go and find a {result.goal.target} in this demo.")
+        elif goals.request(result.goal, epoch):
+            # A previous goal may have succeeded and left the light on. Start
+            # this one from the dark: otherwise a new goal that fails its first
+            # lookup leaves the lamp apparently still illuminating the old
+            # target. If the lamp will not go dark we do not know what state it
+            # is in, so the new goal does not start at all.
+            if lamp is not None and not _light_off(lamp):
+                _abandon_goal(goals, lamp, "could not put the light out before starting")
+            else:
+                _log(f"goal accepted: {result.goal.summary()}")
+        else:
+            _log("I'm already busy with the last thing you asked me to find.")
+
     if result.moved:
         # The gesture blocked the loop for a beat; drop the frames the driver
         # queued behind it so the tracker reasons about now, not then.
@@ -366,6 +409,186 @@ def _handle_observation(outcome, memory: SceneMemory) -> None:
     _log(f"scene memory now holds: {outcome.observation.to_dict()}")
 
 
+def _physical(label: str, call, *args) -> bool:
+    """Run one control-thread robot/camera operation. True if it worked.
+
+    Every physical step of a goal goes through here. PyBullet, the controller
+    and the capture device can all raise, and a goal that cannot move the robot
+    is a failed goal -- never a dead demo. The caller checks the answer and
+    refuses to advance the state machine on False, so the goal can never
+    "complete" on a step that did not actually happen.
+    """
+    try:
+        call(*args)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        _log(f"{label} failed: {_describe(exc)}", error=True)
+        return False
+    return True
+
+
+def _light_off(lamp) -> bool:
+    """Put the light out, reporting rather than raising. The safe state."""
+    return _physical("turning the light off", lamp.light_off)
+
+
+def _fresh_capture_boundary(sensor) -> bool:
+    """Ask the camera to establish a post-motion acquisition boundary.
+
+    ``AttentionSensor.flush`` grabs until a grab has to wait for the sensor,
+    which is what an empty driver queue feels like; it answers False when it
+    could not prove that. Both a False answer and an exception mean the same
+    thing here -- the next frame might predate the turn -- and the goal fails
+    closed rather than verifying against it.
+    """
+    try:
+        return bool(sensor.flush())
+    except Exception as exc:  # noqa: BLE001 - a dead camera is not a dead demo
+        _log(f"clearing the camera after the turn failed: {_describe(exc)}", error=True)
+        return False
+
+
+def _abandon_goal(goals, lamp, reason: str) -> None:
+    """Drop a goal that no longer belongs to this conversation. Fails closed.
+
+    The light goes out as well as the goal: it is only ever on because a goal
+    completed, so the goal ending means the light has nothing to be on for.
+    Cleanup may itself fail (a simulator that went away mid-shutdown); that is
+    reported and does not mask the reason we are here.
+    """
+    goals.finish()
+    _light_off(lamp)
+    _log(f"dropped the goal: {reason}")
+
+
+def _fail_goal(goals, lamp, line: str, reason: str) -> None:
+    """End a goal without completing it: light off, then say why. Never raises.
+
+    Used for every unsuccessful ending that still deserves a spoken answer --
+    target not found, unknown location, low confidence, a failed lookup call.
+    The light is put out first and unconditionally, because a *previous* goal
+    may have left it on and this one has not earned it.
+    """
+    _light_off(lamp)
+    if not goals.hold(line):
+        # The session would not take the line (already busy, or no longer
+        # active). Do not leave the goal sitting there half-finished.
+        _abandon_goal(goals, lamp, f"{reason}, and the closing line was refused")
+
+
+def _handle_goal(
+    outcome, goals, lamp, player, sensor, tracker, epoch: int, session=None
+) -> None:
+    """Apply one finished goal step on the control thread. Never raises.
+
+    This is the only place a goal becomes physical, and every branch out of it
+    is either a named ``LampController`` behaviour or nothing at all. The
+    location the model reported is used exactly once, as a key into
+    :data:`goal.ORIENTATIONS`; there is no other way out of this function.
+
+    Every state transition's return value is checked. A transition the session
+    refuses means the goal cannot continue, and a goal that cannot continue is
+    abandoned rather than left active -- an active goal blocks every later turn
+    and may be holding the light on.
+    """
+    if not goals.active:
+        # A result from a goal that was already abandoned. It has to be drained
+        # for the session to be usable again, and that is all it is good for:
+        # nothing here may move the robot or touch the light.
+        _log(f"ignored a {outcome.stage} result from an abandoned goal")
+        return
+
+    if outcome.epoch != epoch or tracker.state is not EngagementState.ENGAGED:
+        # The person left while a vision call was in flight. Turning the head
+        # and lighting an empty desk is not a completed goal, it is a robot
+        # acting on a conversation that is over.
+        _abandon_goal(goals, lamp, "no longer the same conversation")
+        return
+
+    # The closing sentence: the physical part is already done either way.
+    if outcome.stage == STAGE_SPEAK:
+        if outcome.error is not None:
+            _log(f"could not say how that went: {outcome.error}", error=True)
+        else:
+            try:
+                player.play(outcome.playback)
+            except Exception as exc:  # noqa: BLE001 - a failed speaker is not a dead demo
+                _log(f"could not play the result: {_describe(exc)}", error=True)
+            else:
+                # The lamp is talking again, through the same speaker as an
+                # ordinary reply, so it extends the same quiet deadline: the
+                # microphone stays shut until this sentence has finished.
+                if session is not None:
+                    session.mark_speaking(outcome.playback.seconds, time.monotonic())
+        goals.finish()
+        return
+
+    if outcome.error is not None:
+        # A failed lookup is a failed goal: no motion, no light, and the
+        # character says so out loud.
+        _log(f"the {outcome.target} lookup failed: {outcome.error}", error=True)
+        _fail_goal(goals, lamp, goals_module.missing_line(outcome.target), "the lookup failed")
+        return
+
+    sighting = outcome.sighting
+    if outcome.stage == STAGE_LOCATE:
+        if not sighting.actionable:
+            # Not found, or found but unsure, or found but nowhere in
+            # particular. All three mean the same thing: do not move.
+            _log(f"first look: {sighting.summary()} -- not turning, not lighting")
+            _fail_goal(
+                goals, lamp, goals_module.missing_line(outcome.target), "nothing to turn towards"
+            )
+            return
+        _log(f"first look: {outcome.target} {sighting.summary()}; turning to face it")
+        # The one line where perception becomes motion. A literal dict of three
+        # argument-free gestures; 'unknown' is not a key, so it cannot get here.
+        if not _physical("orienting towards the target", ORIENTATIONS[sighting.location], lamp):
+            _abandon_goal(goals, lamp, "the orientation gesture failed")
+            return
+        # The gesture blocked the loop for a beat, and the driver queued frames
+        # of the desk as it was *before* the head turned. Establishing the
+        # acquisition boundary is what makes the second look genuinely fresh,
+        # so a boundary we could not establish fails the goal closed.
+        if not _fresh_capture_boundary(sensor):
+            _abandon_goal(goals, lamp, "the camera is not provably past the turn")
+            return
+        if not goals.oriented():
+            _abandon_goal(goals, lamp, "the session refused the movement step")
+        return
+
+    if outcome.stage == STAGE_VERIFY:
+        if not sighting.verified:
+            _log(f"second look: {sighting.summary()} -- leaving the light off")
+            _fail_goal(
+                goals, lamp, goals_module.lost_line(outcome.target), "verification failed"
+            )
+            return
+        # Two independent looks, the second one taken after the head moved,
+        # both confident. Only now.
+        if not _physical("turning the light on", lamp.light_on):
+            _abandon_goal(goals, lamp, "the light would not come on")
+            return
+        _log(f"light ON: {outcome.target} confirmed on a second, fresh frame")
+        if not goals.hold(goals_module.found_line(outcome.target)):
+            # The goal is physically complete; only the sentence is lost. Leave
+            # the light on -- it is the intended successful final state -- but
+            # release the session so later turns are not blocked forever.
+            _log("could not queue the closing line; finishing the goal quietly", error=True)
+            goals.finish()
+        return
+
+    _abandon_goal(goals, lamp, f"unexpected stage {outcome.stage!r}")
+
+
+def _describe(exc: BaseException) -> str:
+    """First line of an exception plus its type; never ``repr``."""
+    try:
+        message = str(exc).splitlines()[0] if str(exc) else ""
+    except Exception:
+        message = ""
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
 def run(
     camera_index: int = 0,
     preview: bool = True,
@@ -376,6 +599,8 @@ def run(
     memory: Optional[SceneMemory] = None,
     observer: Optional[ObservationSession] = None,
     observe_key=None,
+    goals: Optional[GoalSession] = None,
+    player=None,
 ) -> None:
     """Drive the lamp from the camera until interrupted.
 
@@ -387,6 +612,10 @@ def run(
     *observer* is the bounded observation path; when it is present, *memory* is
     the record it fills and the spoken path reads. *observe_key* answers "does
     the user want me to look at the desk now?".
+
+    *goals* is the find-and-light path. It is driven entirely by what the
+    person said -- there is no key for it -- and *player* is the speaker it
+    borrows for its closing sentence.
     """
     memory = memory if memory is not None else SceneMemory()
     # Open the camera before spending time on the simulator, so a permission
@@ -395,6 +624,7 @@ def run(
         sensor = AttentionSensor(camera_index=camera_index).open()
 
     client = None
+    lamp = None
     try:
         client = p.connect(p.DIRECT if headless else p.GUI)
         if client < 0:
@@ -450,6 +680,9 @@ def run(
         if observer is not None:
             print("      while ENGAGED, press 'o' -- in the lamp window or the camera "
                   "preview -- to look at the desk and remember one object.")
+        if goals is not None:
+            print("      while ENGAGED, say \"find my mug and shine your light on it\" "
+                  "and I'll look, turn, look again and light it.")
 
         period = 1.0 / DETECT_HZ
         while True:
@@ -483,6 +716,12 @@ def run(
                 sensor.flush()
             elif transition is EngagementState.IDLE:
                 print(f"[{time.strftime('%H:%M:%S')}] ENGAGED -> IDLE")
+                # Settling back down puts the light out with the pose: the
+                # light is only ever on because a goal completed for someone
+                # who is standing here, and they are not any more.
+                if goals is not None and goals.active:
+                    _abandon_goal(goals, lamp, "the person left")
+                _light_off(lamp)
                 lamp.neutral()
                 sensor.flush()
             else:
@@ -513,6 +752,13 @@ def run(
                     _log("not engaged yet; look at the camera first.")
                 elif observer.busy:
                     _log("still looking at the last thing you showed me.")
+                elif goals is not None and goals.occupied:
+                    # A goal is mid-flight and already owns the camera, the
+                    # head and the light. Two vision paths at once would make
+                    # "which frame was that?" unanswerable. `occupied` rather
+                    # than `active`, so an *abandoned* goal whose worker is
+                    # still holding the shared brain blocks this too.
+                    _log("hold on -- I'm still looking for that.")
                 elif session is not None and session.busy:
                     # A turn is mid-prepare and has already read the memory.
                     # Observing now would leave "did that answer use the new
@@ -527,6 +773,46 @@ def run(
                         if observer.start(jpeg):
                             _log(f"looking at the desk ({len(jpeg)} byte frame)...")
 
+            # A goal that is waiting for a camera frame gets *this tick's*
+            # frame, which is the whole point of the two-stage shape. This runs
+            # BEFORE the goal is polled below, and that ordering is load
+            # bearing: the orientation gesture is played inside the poll, so a
+            # frame handed over afterwards would be one taken before the head
+            # moved. Waiting a tick costs ~65 ms and buys a genuinely fresh
+            # second look.
+            if goals is not None and goals.awaiting_frame:
+                if tracker.state is not EngagementState.ENGAGED or goals.epoch != epoch:
+                    _abandon_goal(goals, lamp, "no longer the same conversation")
+                else:
+                    try:
+                        jpeg = encode_frame_jpeg(reading.frame)
+                    except CameraError as exc:
+                        _log(f"could not use that frame: {exc}", error=True)
+                        _abandon_goal(goals, lamp, "no usable camera frame")
+                    else:
+                        target = goals.goal.target
+                        if goals.supply_frame(jpeg):
+                            _log(
+                                f"look {goals.looks} for the {target} "
+                                f"({len(jpeg)} byte frame)..."
+                            )
+
+            # The closing sentence waits here until the lamp's speaker is free.
+            # Preparing it earlier would hand the shared player a second job
+            # while it is still reading the staged audio of the turn's reply.
+            if goals is not None and goals.held:
+                if session is not None and session.speaking(time.monotonic()):
+                    pass  # still mid-sentence; try again next tick
+                elif not goals.say():
+                    _abandon_goal(goals, lamp, "the closing line could not be started")
+
+            if goals is not None:
+                step = goals.poll()
+                if step is not None:
+                    _handle_goal(
+                        step, goals, lamp, player, sensor, tracker, epoch, session
+                    )
+
             # Talking is only offered once the character has actually noticed
             # someone, so the spoken path is downstream of engagement rather
             # than a second, parallel way in. Starting a turn only hands work
@@ -537,6 +823,13 @@ def run(
                     _log("not engaged yet; look at the camera first.")
                 elif session.busy:
                     _log("still working on the last thing you said.")
+                elif goals is not None and goals.occupied:
+                    # A goal owns the head and the light until it finishes. A
+                    # turn started now could hand back a second goal, or a
+                    # gesture, in the middle of one. `occupied` rather than
+                    # `active`: an abandoned goal's worker is still using the
+                    # shared brain and the shared player.
+                    _log("hold on -- I'm still looking for that.")
                 elif observer is not None and not observer.ready():
                     # The other half of the guard above: a look is in flight, so
                     # the answer would depend on whether the vision call beat
@@ -551,7 +844,9 @@ def run(
             if session is not None:
                 outcome = session.poll()
                 if outcome is not None:
-                    _handle_outcome(outcome, session, voice, sensor, tracker, epoch)
+                    _handle_outcome(
+                        outcome, session, voice, sensor, tracker, epoch, goals, lamp
+                    )
 
             # Pace the perception loop to DETECT_HZ so it does not spin a core
             # for information the camera cannot supply any faster. A behaviour
@@ -559,6 +854,13 @@ def run(
             # collapses to zero.
             time.sleep(max(0.0, period - (time.monotonic() - tick)))
     finally:
+        # Leave the robot dark on the way out, whatever ended the loop. The
+        # light is the one piece of state that would otherwise outlive the
+        # process on a real fixture.
+        if lamp is not None:
+            # Reports rather than raises: the simulator may already be gone,
+            # and a failed cleanup must not replace whatever ended the loop.
+            _light_off(lamp)
         sensor.close()
         if preview:
             cv2.destroyAllWindows()
@@ -581,15 +883,22 @@ def main() -> None:
     voice_factory = None
     memory = SceneMemory()
     observer = None
+    goal_session = None
+    player = None
     if not args.no_voice:
         # Check the credential before opening a camera or a GUI, so a missing
         # key is a one-line startup error rather than a surprise mid-demo.
         require_api_key()
-        # One client for both the spoken turn and the observation, and one
-        # memory that the observation writes and the spoken turn reads.
+        # One client for the spoken turn, the observation and the goal; one
+        # memory that the observation writes and the spoken turn reads; one
+        # speaker shared by the turn and the goal's closing sentence.
         brain = CharacterBrain()
+        player = SpeakerPlayer()
         observer = ObservationSession(brain)
-        voice_factory = lambda lamp: build_voice_turn(lamp, memory, brain)  # noqa: E731
+        goal_session = GoalSession(brain, player)
+        voice_factory = lambda lamp: build_voice_turn(  # noqa: E731
+            lamp, memory, brain, player
+        )
 
     run(
         camera_index=args.camera_index,
@@ -598,6 +907,8 @@ def main() -> None:
         voice_factory=voice_factory,
         memory=memory,
         observer=observer,
+        goals=goal_session,
+        player=player,
     )
 
 

@@ -43,6 +43,7 @@ from typing import Callable, Dict, Optional
 
 from audio_io import AudioError, PreparedPlayback, Player, Recorder
 from character import ALLOWED_BEHAVIORS, CharacterBrain, CharacterError, redact
+from goal import NO_GOAL, Goal
 from scene_memory import SceneMemory
 
 
@@ -89,6 +90,10 @@ class PreparedTurn:
     reply: str
     behavior: str
     playback: PreparedPlayback
+    #: The goal the person asked for, or NO_GOAL. Carried, never executed here:
+    #: this class dispatches gestures, and a goal is not a gesture. The demo
+    #: loop starts it separately, against fresh camera evidence.
+    goal: Goal = NO_GOAL
 
 
 @dataclass(frozen=True)
@@ -102,6 +107,8 @@ class TurnResult:
     moved: bool
     #: How long the character will be talking, so the caller can stay quiet.
     speech_seconds: float
+    #: Passed through for the caller to act on, if it has a goal path at all.
+    goal: Goal = NO_GOAL
 
 
 class VoiceTurn:
@@ -166,6 +173,7 @@ class VoiceTurn:
             reply=reply.reply,
             behavior=reply.behavior,
             playback=playback,
+            goal=reply.goal,
         )
 
     # -- phase 2: commit ---------------------------------------------------
@@ -196,6 +204,7 @@ class VoiceTurn:
             behavior=prepared.behavior,
             moved=prepared.behavior != "none",
             speech_seconds=prepared.playback.seconds,
+            goal=prepared.goal,
         )
 
     def run(self) -> TurnResult:
@@ -272,7 +281,11 @@ class VoiceSession:
         self._spawn = spawn if spawn is not None else _spawn_thread
         self._results: "queue.Queue[TurnOutcome]" = queue.Queue(maxsize=1)
         self._running = threading.Event()
-        #: Wall-clock time before which a new turn would talk over the lamp.
+        #: Monotonic time before which anything else would talk over the lamp.
+        #: This is the *lamp's speaker* deadline, not just this session's: the
+        #: goal path plays through the same player and marks it here too, which
+        #: is what stops the closing sentence being prepared on top of audio the
+        #: player is still reading.
         self._quiet_until = 0.0
 
     @property
@@ -316,10 +329,20 @@ class VoiceSession:
         except queue.Empty:
             return None
 
+    def speaking(self, now: float) -> bool:
+        """True while the lamp's speaker is still busy with something.
+
+        Read by the goal path before it prepares its closing sentence, so the
+        two never hand the same player overlapping work.
+        """
+        return now < self._quiet_until
+
     def mark_speaking(self, seconds: float, now: float) -> None:
         """Refuse new turns until the character has finished this sentence.
 
         Without this, a second push-to-talk would record the lamp's own voice.
+        Called for the goal's closing playback as well as for a spoken turn:
+        one lamp, one mouth, one deadline.
         """
         self._quiet_until = max(self._quiet_until, now + max(0.0, seconds))
 

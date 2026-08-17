@@ -25,6 +25,14 @@ bundled Haar frontal-face cascade:
 This is deliberately not gaze estimation. It cannot tell "looking at the lamp"
 from "looking just past the lamp", and that is an accepted limitation for this
 milestone -- see the known limitations in the write-up.
+
+Frame freshness
+---------------
+:meth:`AttentionSensor.flush` is the other job this module does. After the lamp
+moves, the driver may still hold frames captured before the motion, and a
+caller that needs to *see the result of the motion* must not be given one.
+Because queue depth is backend-dependent, the boundary is established by timing
+rather than by counting -- see :data:`FRESH_GRAB_SECONDS`.
 """
 
 from __future__ import annotations
@@ -106,6 +114,35 @@ OBSERVE_JPEG_QUALITY = 70
 
 #: Hard local ceiling on what we are willing to upload from one frame.
 OBSERVE_MAX_BYTES = 400_000
+
+# -- the freshness boundary -------------------------------------------------
+#
+# After the lamp moves, every frame the driver captured *during* the motion is
+# stale, and a stale frame used as visual verification is worse than no
+# verification at all. The old implementation grabbed a fixed two frames, which
+# is not a boundary: CAP_PROP_BUFFERSIZE is advisory and a backend is free to
+# hold four or ten.
+#
+# What is backend-independent is *timing*. A frame already sitting in the
+# driver's queue is handed over almost instantly; once the queue is empty,
+# grab() has to wait for the sensor's next exposure. So we grab until one grab
+# actually blocks, and that blocking grab is the boundary: everything captured
+# before it has been discarded, and everything after it is a live exposure.
+
+#: A grab that took at least this long waited for the sensor rather than being
+#: handed a queued frame. Comfortably above a queue pop (tens of microseconds)
+#: and comfortably below one frame period even at 120 fps (8.3 ms).
+FRESH_GRAB_SECONDS = 0.005
+
+#: Ceiling on how long establishing the boundary may take. A camera that never
+#: makes us wait (a virtual device, a file-backed capture) would otherwise spin
+#: here forever; after this we give up and say so rather than blocking the
+#: control loop.
+FRESH_BOUNDARY_SECONDS = 1.0
+
+#: ...and a ceiling on the number of grabs, so a device that returns instantly
+#: *and* has a fast clock cannot spin either.
+FRESH_MAX_GRABS = 240
 
 
 class EngagementState(Enum):
@@ -232,17 +269,45 @@ class AttentionSensor:
         faces = self._detect_faces(frame)
         return AttentionReading(attending=bool(faces), faces=tuple(faces), frame=frame)
 
-    def flush(self) -> None:
-        """Drop any frames the driver queued while we were busy elsewhere.
+    def flush(self) -> bool:
+        """Establish a post-motion acquisition boundary. See FRESH_GRAB_SECONDS.
 
-        A robot behaviour blocks for ~1.5 s. On backends that ignore
-        CAP_PROP_BUFFERSIZE the next ``read()`` would otherwise return a frame
-        from *before* the motion, so the state machine would be reasoning
-        about the past.
+        A robot behaviour blocks for ~1.5 s, and the frames the driver queued
+        during it show the desk as it was *before* the lamp turned. Grabbing a
+        fixed number of them is guesswork; instead we grab until a grab has to
+        wait for the sensor, which is what an empty queue feels like. After
+        that, the next ``read()`` is a live exposure.
+
+        Returns True when the boundary was established. False means "I could
+        not prove the queue is empty" -- the caller decides whether that
+        matters. The engagement transitions ignore it (a slightly stale frame
+        costs a fraction of a second of hysteresis); the goal path treats it as
+        a failure and refuses to verify, because there the stale frame would
+        become the evidence for turning the light on.
+
+        Never raises: a camera that has gone away is reported by the next
+        ``read()``, exactly as it was before this method learned to wait.
         """
-        if self._capture is not None:
-            for _ in range(2):
-                self._capture.grab()
+        if self._capture is None:
+            return False
+
+        deadline = time.monotonic() + FRESH_BOUNDARY_SECONDS
+        for _ in range(FRESH_MAX_GRABS):
+            started = time.monotonic()
+            try:
+                ok = self._capture.grab()
+            except cv2.error:
+                return False  # the next read() will raise, as it always did
+            if not ok:
+                return False
+            if time.monotonic() - started >= FRESH_GRAB_SECONDS:
+                # We waited for the sensor, so nothing was queued behind that
+                # frame. It has been grabbed and discarded; the next read()
+                # returns an exposure taken after this moment.
+                return True
+            if time.monotonic() >= deadline:
+                break
+        return False
 
     def _detect_faces(self, frame) -> List[FaceBox]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
