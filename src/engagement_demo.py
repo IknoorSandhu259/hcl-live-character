@@ -14,12 +14,23 @@ demo records a short bounded utterance, sends it through speech-to-text, the
 character model and text-to-speech, plays the reply through the speaker and
 performs at most one named gesture.
 
+Also while ENGAGED, press 'o' (in the lamp window or the camera preview) and
+the character takes one look at the desk: a single frame goes to the vision
+call, and the five validated fields that come back are stored in local scene
+memory and printed. A later spoken question is answered from that record --
+the recall path has no camera in it at all, so the answer survives the object
+being moved or taken away.
+
 This file is the *wiring* only, and is deliberately thin:
 
     attention.AttentionSensor      camera -> "is a face facing us?"  (perception)
     attention.EngagementTracker    noisy booleans -> IDLE / ENGAGED  (policy)
+    attention.encode_frame_jpeg    one frame -> bounded JPEG bytes
     audio_io                       microphone / speaker              (audio)
-    character.CharacterBrain       transcript -> {reply, behavior}   (language)
+    character.CharacterBrain       transcript + note -> {reply, behavior}  (language)
+                                   one frame -> a scene observation
+    scene_memory.SceneMemory       the retained facts, locally owned
+    scene_memory.ObservationSession  the vision call, off this thread
     voice_turn.VoiceTurn           one turn, and the action allowlist
     voice_turn.VoiceSession        the slow half of a turn, off this thread
     robot_controller.LampController   IDLE / ENGAGED / gesture -> motion (body)
@@ -42,6 +53,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import pybullet as p
@@ -54,10 +66,17 @@ from attention import (  # noqa: E402
     CameraError,
     EngagementState,
     EngagementTracker,
+    encode_frame_jpeg,
 )
 from audio_io import MicrophoneRecorder, SpeakerPlayer  # noqa: E402
-from character import CharacterBrain, MissingCredentialsError, require_api_key  # noqa: E402
+from character import (  # noqa: E402
+    CharacterBrain,
+    CharacterError,
+    MissingCredentialsError,
+    require_api_key,
+)
 from robot_controller import LampController, load_lamp  # noqa: E402
+from scene_memory import ObservationSession, SceneMemory  # noqa: E402
 from voice_turn import TurnError, VoiceSession, VoiceTurn  # noqa: E402
 
 #: Simulation time advanced per perception tick while no behaviour is playing.
@@ -70,12 +89,22 @@ PREVIEW_WINDOW = "lamp attention"
 #: Push-to-talk keys accepted by the preview window: 't', Enter, keypad Enter.
 TALK_KEYS = (ord("t"), 13, 10)
 
+#: "Have a look at the desk" in the preview window.
+OBSERVE_KEYS = (ord("o"),)
+
 
 def _draw_preview(reading, state: EngagementState) -> None:
-    """Show what the perception layer actually sees. Debug aid, not a UI."""
-    frame = reading.frame
-    if frame is None:
+    """Show what the perception layer actually sees. Debug aid, not a UI.
+
+    Annotates a *copy*. ``cv2.rectangle`` and ``cv2.putText`` draw in place, and
+    the same ``reading.frame`` is what an observation uploads later in the same
+    tick -- so drawing on the original would send the vision model our own face
+    boxes and status text instead of the camera image. The copy costs about a
+    megabyte per tick at 640x480 and removes the coupling entirely.
+    """
+    if reading.frame is None:
         return
+    frame = reading.frame.copy()
     colour = (0, 200, 0) if state is EngagementState.ENGAGED else (0, 165, 255)
     for (x, y, w, h) in reading.faces:
         cv2.rectangle(frame, (x, y), (x + w, y + h), colour, 2)
@@ -149,32 +178,99 @@ class TerminalTalkKey:
             hit = hit or b"\n" in chunk or b"\r" in chunk or b"t" in chunk
 
 
-class SimulatorTalkKey:
-    """Push-to-talk from inside the PyBullet GUI window.
+class SimulatorKeyboard:
+    """The PyBullet window's keyboard, read exactly once per control tick.
 
-    With the simulator on screen the window usually has keyboard focus, so
-    keystrokes never reach the terminal at all -- which is why the terminal
-    watcher alone looked dead during the macOS run. PyBullet already reports
-    the keys its own window received, so asking it is both the smallest fix and
-    the one that matches where the user is actually looking.
+    ``p.getKeyboardEvents`` is *draining*: it reports what happened since the
+    last call, so a KEY_WAS_TRIGGERED flag is delivered to whoever asks first
+    and to nobody else. With push-to-talk and the observation key each asking
+    on their own, the talk poll ran first every tick and silently ate the 'o'
+    press before the observation handler could see it.
+
+    So the loop polls here once, and both keys read the same event set.
+    """
+
+    def __init__(self, client_id: int):
+        self.client_id = client_id
+        #: Keys that were triggered during the tick just polled.
+        self.triggered: frozenset = frozenset()
+        #: How many times the window was actually asked. Tests assert on it.
+        self.polls = 0
+
+    def poll(self) -> None:
+        """Drain the window's events into :attr:`triggered`. Once per tick."""
+        self.polls += 1
+        try:
+            events = p.getKeyboardEvents(physicsClientId=self.client_id)
+        except Exception:
+            events = {}  # no GUI, or the client went away mid-shutdown
+        self.triggered = frozenset(
+            key for key, state in events.items() if state & p.KEY_WAS_TRIGGERED
+        )
+
+
+class SimulatorKey:
+    """Reports whether one set of keys is in the current tick's events.
+
+    Given a shared :class:`SimulatorKeyboard` it is a pure reader and polls
+    nothing. Given only a client id it owns a keyboard and polls it itself,
+    which is how it behaves outside the demo loop.
 
     Inert (and harmless) in DIRECT/headless mode, where there is no window.
     """
 
+    KEYS: tuple = ()
+
+    def __init__(
+        self,
+        client_id: Optional[int] = None,
+        keyboard: Optional[SimulatorKeyboard] = None,
+        keys: Optional[tuple] = None,
+    ):
+        if keyboard is None and client_id is None:
+            raise ValueError("a SimulatorKey needs either a keyboard or a client id")
+        self.keyboard = keyboard if keyboard is not None else SimulatorKeyboard(client_id)
+        #: True when nobody else is polling for us.
+        self.self_polling = keyboard is None
+        self.keys = frozenset(keys if keys is not None else self.KEYS)
+
+    @property
+    def client_id(self) -> int:
+        return self.keyboard.client_id
+
+    def pressed(self) -> bool:
+        if self.self_polling:
+            self.keyboard.poll()
+        return bool(self.keyboard.triggered & self.keys)
+
+
+class SimulatorTalkKey(SimulatorKey):
+    """Push-to-talk from inside the PyBullet GUI window."""
+
     #: Enter, space, or 't'. Enter and space are what people try first.
     KEYS = (p.B3G_RETURN, ord(" "), ord("t"))
 
-    def __init__(self, client_id: int):
-        self.client_id = client_id
 
-    def pressed(self) -> bool:
-        try:
-            events = p.getKeyboardEvents(physicsClientId=self.client_id)
-        except Exception:
-            return False  # no GUI, or the client went away mid-shutdown
-        return any(
-            events.get(key, 0) & p.KEY_WAS_TRIGGERED for key in self.KEYS
-        )
+class SimulatorObserveKey(SimulatorKey):
+    """"Have a look at the desk" from inside the PyBullet GUI window.
+
+    Deliberately its own key rather than a spoken command: an observation is
+    the one event that sends a picture off this machine, so it happens when a
+    person presses a key for it and at no other time.
+    """
+
+    KEYS = (ord("o"),)
+
+
+def build_simulator_keys(client_id: int):
+    """One keyboard, two readers. Returns ``(keyboard, talk, observe)``.
+
+    Constructing them together is what guarantees the single poll: there is no
+    arrangement of these three objects in which two ``getKeyboardEvents`` calls
+    can happen in one tick.
+    """
+    keyboard = SimulatorKeyboard(client_id)
+    return keyboard, SimulatorTalkKey(keyboard=keyboard), SimulatorObserveKey(keyboard=keyboard)
 
 
 class AnyTalkKey:
@@ -191,13 +287,23 @@ class AnyTalkKey:
         return any([source.pressed() for source in self.sources])
 
 
-def build_voice_turn(lamp: LampController) -> VoiceTurn:
-    """Default wiring of the spoken path onto a live lamp."""
+def build_voice_turn(
+    lamp: LampController,
+    memory: Optional[SceneMemory] = None,
+    brain: Optional[CharacterBrain] = None,
+) -> VoiceTurn:
+    """Default wiring of the spoken path onto a live lamp.
+
+    *brain* is shared with the observation path when there is one, so the
+    process holds a single OpenAI client. *memory* is the same object the
+    observation path writes to; the turn only reads it.
+    """
     return VoiceTurn(
-        brain=CharacterBrain(),
+        brain=brain if brain is not None else CharacterBrain(),
         recorder=MicrophoneRecorder(),
         player=SpeakerPlayer(),
         lamp=lamp,
+        memory=memory,
     )
 
 
@@ -241,6 +347,25 @@ def _handle_outcome(outcome, session, voice, sensor, tracker, epoch: int) -> Non
         sensor.flush()
 
 
+def _handle_observation(outcome, memory: SceneMemory) -> None:
+    """Apply one finished observation on the control thread. Never raises.
+
+    The single place the scene memory is written, so "what does the character
+    know, and when did it learn it?" is answered by these two log lines.
+    """
+    if outcome.error is not None:
+        # Includes the honest "I could not make out one clear object": nothing
+        # is stored, and the previous note (if any) is left untouched.
+        _log(f"looked, but remembered nothing: {outcome.error}", error=True)
+        return
+
+    previous = memory.remember(outcome.observation)
+    if previous is not None:
+        _log(f"replacing what I had noted: {previous.summary()}")
+    _log(f"remembered: {outcome.observation.summary()}")
+    _log(f"scene memory now holds: {outcome.observation.to_dict()}")
+
+
 def run(
     camera_index: int = 0,
     preview: bool = True,
@@ -248,6 +373,9 @@ def run(
     sensor=None,
     voice_factory=None,
     talk_key=None,
+    memory: Optional[SceneMemory] = None,
+    observer: Optional[ObservationSession] = None,
+    observe_key=None,
 ) -> None:
     """Drive the lamp from the camera until interrupted.
 
@@ -255,7 +383,12 @@ def run(
     fake reader; leave it None to use the real webcam. *voice_factory* is
     called with the LampController to build the spoken path; leave it None for
     the camera-only demo. *talk_key* answers "does the user want to talk now?".
+
+    *observer* is the bounded observation path; when it is present, *memory* is
+    the record it fills and the spoken path reads. *observe_key* answers "does
+    the user want me to look at the desk now?".
     """
+    memory = memory if memory is not None else SceneMemory()
     # Open the camera before spending time on the simulator, so a permission
     # or device problem surfaces immediately instead of behind a GUI window.
     if sensor is None:
@@ -284,13 +417,25 @@ def run(
 
         voice = voice_factory(lamp) if voice_factory is not None else None
         session = VoiceSession(voice) if voice is not None else None
+
+        # One keyboard for the lamp window, shared by both keys and polled once
+        # per tick by the loop below -- see SimulatorKeyboard for why.
+        keyboard = sim_talk = sim_observe = None
+        needs_window_keys = (voice is not None and talk_key is None) or (
+            observer is not None and observe_key is None
+        )
+        if needs_window_keys and not headless:
+            keyboard, sim_talk, sim_observe = build_simulator_keys(client)
+
         if voice is not None and talk_key is None:
             # Two sources, because which window has focus is not ours to
             # decide: the terminal, and the PyBullet window when there is one.
-            talk_key = AnyTalkKey(
-                TerminalTalkKey(),
-                None if headless else SimulatorTalkKey(client),
-            )
+            talk_key = AnyTalkKey(TerminalTalkKey(), sim_talk)
+        if observer is not None and observe_key is None:
+            # 'o' comes from a window, not the terminal: the terminal watcher
+            # drains stdin wholesale for push-to-talk, so a second reader on the
+            # same descriptor would steal its bytes.
+            observe_key = sim_observe
         #: Bumped on every IDLE -> ENGAGED transition. A turn carries the value
         #: it started under, which is how a result that outlived its
         #: conversation is recognised and dropped.
@@ -302,6 +447,9 @@ def run(
         if voice is not None:
             print("      while ENGAGED, press Enter to talk -- in this terminal, "
                   "in the lamp window, or 't' in the camera preview.")
+        if observer is not None:
+            print("      while ENGAGED, press 'o' -- in the lamp window or the camera "
+                  "preview -- to look at the desk and remember one object.")
 
         period = 1.0 / DETECT_HZ
         while True:
@@ -312,13 +460,21 @@ def run(
                 break  # a scripted fake sensor ran out of frames
             transition = tracker.update(reading.attending, tick)
 
+            # Exactly one getKeyboardEvents call per tick, before either key
+            # reads it. Asking twice would let the first reader drain the 'o'
+            # press the second one was waiting for.
+            if keyboard is not None:
+                keyboard.poll()
+
             wants_to_talk = talk_key.pressed() if talk_key is not None else False
+            wants_to_look = observe_key.pressed() if observe_key is not None else False
             if preview:
                 _draw_preview(reading, tracker.state)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
                 wants_to_talk = wants_to_talk or key in TALK_KEYS
+                wants_to_look = wants_to_look or key in OBSERVE_KEYS
 
             if transition is EngagementState.ENGAGED:
                 epoch += 1
@@ -333,6 +489,44 @@ def run(
                 # No transition: hold the pose and keep the physics ticking.
                 lamp.step(IDLE_SIM_STEP)
 
+            # Finished observations are banked *first*, before anything this
+            # tick can consult or extend the memory. Two things fall out of
+            # that ordering: a second 'o' press is judged against a session
+            # that has already been drained rather than being refused for a
+            # result nobody collected yet, and a spoken turn started later in
+            # this same tick reads a memory that is up to date.
+            #
+            # An observation is about the desk, not about the person, so unlike
+            # a spoken turn it is still worth keeping if they looked away while
+            # the call was in flight.
+            if observer is not None:
+                seen = observer.poll()
+                if seen is not None:
+                    _handle_observation(seen, memory)
+
+            # One frame, once, when a person asks for it. The frame is encoded
+            # here -- on the thread that owns the camera -- and only the JPEG
+            # bytes cross to the worker, so the vision call never blocks the
+            # loop and never reaches back into OpenCV.
+            if observer is not None and wants_to_look:
+                if tracker.state is not EngagementState.ENGAGED:
+                    _log("not engaged yet; look at the camera first.")
+                elif observer.busy:
+                    _log("still looking at the last thing you showed me.")
+                elif session is not None and session.busy:
+                    # A turn is mid-prepare and has already read the memory.
+                    # Observing now would leave "did that answer use the new
+                    # record?" up to which network call returned first.
+                    _log("hold on -- I'm still thinking about what you said.")
+                else:
+                    try:
+                        jpeg = encode_frame_jpeg(reading.frame)
+                    except CameraError as exc:
+                        _log(f"could not use that frame: {exc}", error=True)
+                    else:
+                        if observer.start(jpeg):
+                            _log(f"looking at the desk ({len(jpeg)} byte frame)...")
+
             # Talking is only offered once the character has actually noticed
             # someone, so the spoken path is downstream of engagement rather
             # than a second, parallel way in. Starting a turn only hands work
@@ -343,6 +537,12 @@ def run(
                     _log("not engaged yet; look at the camera first.")
                 elif session.busy:
                     _log("still working on the last thing you said.")
+                elif observer is not None and not observer.ready():
+                    # The other half of the guard above: a look is in flight, so
+                    # the answer would depend on whether the vision call beat
+                    # the transcription. Wait a beat and the question is
+                    # answered against a settled memory.
+                    _log("hold on -- I'm still looking at the desk.")
                 elif not session.start(epoch, time.monotonic()):
                     _log("still talking; wait for me to finish.")
                 else:
@@ -379,17 +579,25 @@ def main() -> None:
     args = parser.parse_args()
 
     voice_factory = None
+    memory = SceneMemory()
+    observer = None
     if not args.no_voice:
         # Check the credential before opening a camera or a GUI, so a missing
         # key is a one-line startup error rather than a surprise mid-demo.
         require_api_key()
-        voice_factory = build_voice_turn
+        # One client for both the spoken turn and the observation, and one
+        # memory that the observation writes and the spoken turn reads.
+        brain = CharacterBrain()
+        observer = ObservationSession(brain)
+        voice_factory = lambda lamp: build_voice_turn(lamp, memory, brain)  # noqa: E731
 
     run(
         camera_index=args.camera_index,
         preview=not args.no_preview,
         headless=args.headless,
         voice_factory=voice_factory,
+        memory=memory,
+        observer=observer,
     )
 
 
@@ -398,6 +606,12 @@ if __name__ == "__main__":
         main()
     except MissingCredentialsError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except CharacterError as exc:
+        # Building the shared client can fail before the loop starts (no SDK
+        # installed, malformed key). Subclass order matters: the credential
+        # case above is more specific and is caught first.
+        print(f"language layer unavailable: {exc}", file=sys.stderr)
         sys.exit(1)
     except CameraError as exc:
         print(f"camera error: {exc}", file=sys.stderr)

@@ -17,16 +17,37 @@ limit-clamped gesture.
 Structured output is requested from the Responses API, but the result is still
 validated locally (:func:`parse_character_reply`). Model-side schema
 enforcement is a convenience, not a trust boundary.
+
+Two kinds of call, and only one of them carries a picture
+---------------------------------------------------------
+:meth:`CharacterBrain.observe` is the *only* method in the system that sends an
+image. It happens once, when the person asks the character to look, and its
+whole output is a five-field record that ``scene_memory`` validates and stores.
+
+:meth:`CharacterBrain.respond` answers a spoken question and takes the retained
+facts as *text*. It has no image parameter and no camera access, so a question
+about the mug is answered from the note, never by looking again -- which is
+what makes the answer survive the mug being moved or taken away.
 """
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from scene_memory import (
+    LOCATIONS,
+    MAX_COLOR_CHARS,
+    MAX_DETAIL_CHARS,
+    MAX_NAME_CHARS,
+    SceneObservation,
+    parse_observation,
+)
 
 # --------------------------------------------------------------------------
 # Models
@@ -35,6 +56,13 @@ from typing import Any, Optional
 STT_MODEL = "gpt-4o-mini-transcribe"
 CHARACTER_MODEL = "gpt-5.6-luna"
 TTS_MODEL = "tts-1"
+
+#: The model asked to look at one camera frame. The same Responses-API model as
+#: the character voice by default -- one fewer moving part, and the reply it has
+#: to produce is five short fields, not an essay. Overridable from the
+#: environment so a deployment whose character model is text-only can point the
+#: single vision call somewhere else without touching the code.
+VISION_MODEL = os.environ.get("LAMP_VISION_MODEL", "").strip() or CHARACTER_MODEL
 
 #: The transcription models in the gpt-4o-*-transcribe family only support the
 #: ``json`` response format on non-streaming requests -- unlike whisper-1, they
@@ -55,6 +83,9 @@ TTS_VOICE = "alloy"
 STT_TIMEOUT_SECONDS = 20.0
 CHARACTER_TIMEOUT_SECONDS = 20.0
 TTS_TIMEOUT_SECONDS = 20.0
+#: Looking is a deliberate, announced pause ("let me have a look"), so it gets a
+#: little longer than a conversational turn -- an image upload is involved.
+OBSERVE_TIMEOUT_SECONDS = 25.0
 MAX_RETRIES = 1
 
 #: Ceiling on the spoken reply. Two short sentences fit comfortably; the cap is
@@ -95,7 +126,14 @@ SYSTEM_PROMPT = (
     "questions you answer with information, for small talk, for compliments, for thanks, and "
     "for anything you are merely acknowledging. If you are unsure, choose 'none'."
     "\n\n"
-    "You do not remember earlier conversations and should not pretend to."
+    "You do not remember earlier conversations and should not pretend to.\n"
+    "You may, however, be given a block headed 'SCENE MEMORY' before the person's "
+    "words. That is your own note about one object you looked at earlier through your "
+    "camera. Treat it as the only thing you know about the scene. You are not looking "
+    "now, so speak about it in the past tense ('it was a white mug, over on my left'). "
+    "If the note is absent, or does not contain what they asked for, say plainly that "
+    "you did not note that -- never guess a colour, a position or a detail, and never "
+    "claim to be looking at something right now."
 )
 
 RESPONSE_SCHEMA: dict[str, Any] = {
@@ -127,6 +165,77 @@ class CharacterReply:
 
     reply: str
     behavior: str
+
+
+# --------------------------------------------------------------------------
+# The observation contract
+# --------------------------------------------------------------------------
+#
+# One frame in, five short fields out. The vision call cannot request a
+# behaviour, cannot produce speech and cannot reach the robot: its entire
+# output is a record that `scene_memory.parse_observation` validates before
+# anything is stored.
+
+OBSERVE_PROMPT = (
+    "You are the eye of a small desk lamp robot. You are shown ONE frame from its "
+    "camera, looking out across the desk in front of it.\n"
+    "Pick the single most obvious object on the desk -- the one a person would mean if "
+    "they said 'this thing here'. Ignore the person, their face and hands, the walls, "
+    "the floor and the room.\n"
+    "Report it in the given fields:\n"
+    "  name    - a common noun for the object, one or two words ('mug', 'water bottle').\n"
+    "  color   - its main visible colour, in plain words.\n"
+    "  location- 'left', 'center' or 'right', meaning which side of the frame it is on; "
+    "use 'unknown' only if you genuinely cannot tell.\n"
+    "  detail  - ONE further short fact you are sure of (shape, material, a marking, "
+    "what is next to it). Use an empty string rather than guessing.\n"
+    "  confident - true only if you are sure there is one clear object and that name and "
+    "colour are right. If the frame is dark, blurred, empty, or shows only a person, "
+    "answer false and leave the other fields as short placeholders.\n"
+    "Report only what is visible in this frame. Do not invent, and do not describe the "
+    "person."
+)
+
+#: What the vision call is asked, alongside the image itself.
+OBSERVE_REQUEST = "Look at this frame and describe the one clearest object on the desk."
+
+OBSERVATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": f"Common noun for the object, at most {MAX_NAME_CHARS} characters.",
+        },
+        "color": {
+            "type": "string",
+            "description": f"Main visible colour, at most {MAX_COLOR_CHARS} characters.",
+        },
+        "location": {
+            "type": "string",
+            "enum": list(LOCATIONS),
+            "description": "Which side of the frame the object is on.",
+        },
+        "detail": {
+            "type": "string",
+            "description": (
+                "One further short fact you are sure of, or an empty string. "
+                f"At most {MAX_DETAIL_CHARS} characters."
+            ),
+        },
+        "confident": {
+            "type": "boolean",
+            "description": (
+                "True only if one clear object was identified and the name and colour "
+                "are right. False means nothing is remembered."
+            ),
+        },
+    },
+    "required": ["name", "color", "location", "detail", "confident"],
+    "additionalProperties": False,
+}
+
+#: Five short fields; the cap is a backstop, not the control.
+MAX_OBSERVATION_TOKENS = 200
 
 
 # --------------------------------------------------------------------------
@@ -256,13 +365,20 @@ class CharacterBrain:
 
     # -- stage 2: thinking -------------------------------------------------
 
-    def respond(self, transcript: str) -> CharacterReply:
-        """Answer *transcript* in character and choose zero or one gesture."""
+    def respond(self, transcript: str, scene_note: str = "") -> CharacterReply:
+        """Answer *transcript* in character and choose zero or one gesture.
+
+        *scene_note* is the text rendered by :meth:`scene_memory.SceneMemory.
+        prompt_note` -- the facts the character noted when it last looked, or
+        "" if it has never looked. It is passed as text and nothing else: this
+        method has no way to reach a camera, so recall cannot become a second
+        observation however the question is phrased.
+        """
         try:
             response = self._client.responses.create(
                 model=CHARACTER_MODEL,
                 instructions=SYSTEM_PROMPT,
-                input=transcript,
+                input=_compose_input(transcript, scene_note),
                 text={
                     "format": {
                         "type": "json_schema",
@@ -282,6 +398,60 @@ class CharacterBrain:
             raise CharacterError("character response was empty")
         # Validated locally regardless of the schema request above.
         return parse_character_reply(raw)
+
+    # -- the one call that carries a picture -------------------------------
+
+    def observe(self, jpeg_bytes: bytes) -> SceneObservation:
+        """Look at exactly one frame and return a validated scene record.
+
+        Called from a bounded, person-triggered observation event, never from a
+        loop and never from the recall path. The frame is uploaded inline as a
+        data URL; nothing is stored server-side by us, and the result the
+        character keeps is the five validated fields, not the image.
+
+        Raises :class:`CharacterError` if the call itself failed, and
+        :class:`scene_memory.ObservationError` if the response was unusable or
+        the model was not confident. Either way the caller stores nothing.
+        """
+        if not jpeg_bytes:
+            raise CharacterError("no camera frame to look at")
+
+        encoded = base64.b64encode(jpeg_bytes).decode("ascii")
+        try:
+            response = self._client.responses.create(
+                model=VISION_MODEL,
+                instructions=OBSERVE_PROMPT,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": OBSERVE_REQUEST},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/jpeg;base64,{encoded}",
+                            },
+                        ],
+                    }
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "scene_observation",
+                        "strict": True,
+                        "schema": OBSERVATION_SCHEMA,
+                    }
+                },
+                max_output_tokens=MAX_OBSERVATION_TOKENS,
+                timeout=OBSERVE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            raise CharacterError(f"looking at the scene failed: {_safe(exc)}") from exc
+
+        raw = getattr(response, "output_text", None)
+        if not isinstance(raw, str) or not raw.strip():
+            raise CharacterError("the observation response was empty")
+        # Validated locally regardless of the schema request above.
+        return parse_observation(raw)
 
     # -- stage 3: speaking -------------------------------------------------
 
@@ -304,6 +474,24 @@ class CharacterBrain:
         if not audio:
             raise CharacterError("text-to-speech returned no audio")
         return bytes(audio)
+
+
+#: Label the person's words carry when a scene note precedes them, so the two
+#: blocks cannot be read as one. The note itself is flattened to single-line
+#: fields by ``scene_memory``, so it cannot forge this header.
+SPOKEN_HEADER = "THE PERSON JUST SAID:"
+
+
+def _compose_input(transcript: str, scene_note: str) -> str:
+    """Build the turn's input: the note (when there is one) then the words.
+
+    With no note this is exactly the transcript, unchanged -- an ordinary turn
+    looks the same as it did before scene memory existed.
+    """
+    note = (scene_note or "").strip()
+    if not note:
+        return transcript
+    return f"{note}\n\n{SPOKEN_HEADER}\n{transcript}"
 
 
 def _transcript_text(result) -> str:

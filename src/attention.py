@@ -87,6 +87,26 @@ MISS_TOLERANCE_SECONDS = 0.4
 #: ignored, but genuinely looking away or leaving is honoured.
 DISENGAGE_HOLD_SECONDS = 2.5
 
+# -- the observation frame --------------------------------------------------
+#
+# When the person asks the character to look at the desk, one frame leaves this
+# machine. Encoding it is a camera concern, so it lives here rather than in the
+# language layer: `character.observe` receives plain JPEG bytes and never sees
+# an OpenCV array.
+
+#: Longest edge of the uploaded frame. Enough for "a white mug, on the left" and
+#: about a tenth of the bytes of a full-resolution capture. Capture is already
+#: 640 wide (:data:`FRAME_WIDTH`), so in practice this only bites on a camera
+#: that ignored the requested size.
+OBSERVE_MAX_WIDTH = 640
+
+#: JPEG quality for that frame. Visibly lossy on flat colour, harmless for
+#: naming an object and its colour.
+OBSERVE_JPEG_QUALITY = 70
+
+#: Hard local ceiling on what we are willing to upload from one frame.
+OBSERVE_MAX_BYTES = 400_000
+
 
 class EngagementState(Enum):
     """The only two states this milestone has."""
@@ -237,6 +257,51 @@ class AttentionSensor:
             minSize=(min_side, min_side),
         )
         return [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in faces]
+
+
+def encode_frame_jpeg(
+    frame,
+    max_width: int = OBSERVE_MAX_WIDTH,
+    quality: int = OBSERVE_JPEG_QUALITY,
+) -> bytes:
+    """Encode one BGR frame as bounded JPEG bytes, ready to be looked at.
+
+    Cheap enough (a few milliseconds at this size) to run on the control thread
+    between two camera reads, which is where it belongs: the frame comes from
+    the camera this thread owns, and only the resulting bytes are handed to a
+    worker.
+
+    Raises :class:`CameraError` if there is no frame, the encoder fails, or the
+    result is implausibly large -- all of which mean "do not upload this".
+    """
+    if frame is None:
+        raise CameraError("no camera frame to encode")
+
+    height, width = frame.shape[:2]
+    if width > max_width:
+        scale = max_width / float(width)
+        frame = cv2.resize(
+            frame,
+            (max_width, max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    try:
+        ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    except cv2.error as exc:
+        raise CameraError(f"could not encode the camera frame: {exc}") from exc
+    if not ok:
+        raise CameraError("could not encode the camera frame as JPEG")
+
+    payload = buffer.tobytes()
+    if not payload:
+        raise CameraError("the encoded camera frame was empty")
+    if len(payload) > OBSERVE_MAX_BYTES:
+        raise CameraError(
+            f"the encoded camera frame is {len(payload)} bytes, over the "
+            f"{OBSERVE_MAX_BYTES}-byte upload limit"
+        )
+    return payload
 
 
 @dataclass(frozen=True)

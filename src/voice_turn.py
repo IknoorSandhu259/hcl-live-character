@@ -13,8 +13,9 @@ Two-phase turn
 --------------
 A turn is split at the moment the robot commits to moving:
 
-    prepare()   record -> transcribe -> respond -> validate -> synthesize
-                -> decode + validate audio -> confirm the output device
+    prepare()   record -> transcribe -> read scene memory -> respond
+                -> validate -> synthesize -> decode + validate audio
+                -> confirm the output device
     ------------------------- commit point -------------------------
     commit()    play one named gesture -> hand the audio to PortAudio
 
@@ -42,6 +43,7 @@ from typing import Callable, Dict, Optional
 
 from audio_io import AudioError, PreparedPlayback, Player, Recorder
 from character import ALLOWED_BEHAVIORS, CharacterBrain, CharacterError, redact
+from scene_memory import SceneMemory
 
 
 class TurnError(RuntimeError):
@@ -105,15 +107,29 @@ class TurnResult:
 class VoiceTurn:
     """One push-to-talk exchange, split into prepare and commit.
 
-    All four collaborators are injected, so a unit test can drive the whole
-    path with fakes and no hardware, no key and no network.
+    All collaborators are injected, so a unit test can drive the whole path
+    with fakes and no hardware, no key and no network.
+
+    *memory* is the character's scene memory. The turn reads it and passes the
+    retained facts to the language call as text; it never writes to it, and it
+    has no camera, so a question about an observed object is answered from the
+    note rather than by looking again. Left None it is an empty memory, which
+    makes an ordinary turn identical to the Hour 3 one.
     """
 
-    def __init__(self, brain: CharacterBrain, recorder: Recorder, player: Player, lamp):
+    def __init__(
+        self,
+        brain: CharacterBrain,
+        recorder: Recorder,
+        player: Player,
+        lamp,
+        memory: Optional[SceneMemory] = None,
+    ):
         self.brain = brain
         self.recorder = recorder
         self.player = player
         self.lamp = lamp
+        self.memory = memory if memory is not None else SceneMemory()
 
     # -- phase 1: everything that may fail, before anything that may move ---
 
@@ -129,7 +145,10 @@ class VoiceTurn:
             raise TurnError("recording failed: the microphone returned no audio")
 
         transcript = _stage("speech-to-text", self.brain.transcribe, wav)
-        reply = _stage("character response", self.brain.respond, transcript)
+        # Recall is a local read: the note is text this process already holds,
+        # and no frame is captured or sent anywhere in this path.
+        note = _stage("scene memory", self.memory.prompt_note)
+        reply = _stage("character response", self.brain.respond, transcript, note)
         speech = _stage("text-to-speech", self.brain.synthesize, reply.reply)
 
         # Decoding, format validation and the device's own "will you accept
