@@ -84,8 +84,7 @@ class ObservationSession:
     def start(self, frame) -> bool:
         if self.busy or not self._results.empty():
             return False
-        # Snapshot now. The camera loop may mutate/reuse its next frame, and
-        # preview drawing adds overlays after this point.
+        # Snapshot now. The camera loop may mutate/reuse its next frame.
         snapshot = frame.copy()
         self._running.set()
         threading.Thread(
@@ -174,6 +173,11 @@ def run(camera_index: int = 0, preview: bool = True, headless: bool = False) -> 
             tick = time.monotonic()
             reading = sensor.read()
             transition = tracker.update(reading.attending, tick)
+            # _draw_preview annotates reading.frame in place. Keep an untouched
+            # snapshot now so cloud vision never sees face boxes or status text.
+            clean_observation_frame = (
+                reading.frame.copy() if reading.frame is not None else None
+            )
 
             wants_to_talk = talk_key.pressed()
             wants_to_observe = observe_key.pressed() if observe_key is not None else False
@@ -201,9 +205,11 @@ def run(camera_index: int = 0, preview: bool = True, headless: bool = False) -> 
             if wants_to_observe:
                 if tracker.state is not EngagementState.ENGAGED:
                     _log("not engaged yet; look at the camera before observing.")
+                elif clean_observation_frame is None:
+                    _log("no usable camera frame to observe.", error=True)
                 elif observer.busy:
                     _log("still observing the previous frame.")
-                elif observer.start(reading.frame):
+                elif observer.start(clean_observation_frame):
                     _log("observing one desk object from this frame...")
                 else:
                     _log("previous observation result has not been collected yet.")
