@@ -1,4 +1,4 @@
-"""Goal-action tests: fake camera frames, fake OpenAI client, no hardware.
+﻿"""Goal-action tests: fake camera frames, fake OpenAI client, no hardware.
 
 Nothing here opens a device, reads a credential or makes a paid API call. The
 whole Hour 5 path
@@ -77,7 +77,11 @@ from test_voice_turn import (  # noqa: E402
 )
 
 FOUND_LEFT = {"found": True, "location": "left", "confident": True}
-STILL_THERE = {"found": True, "location": "center", "confident": True}
+
+#: What a *successful* second look says. The laptop camera does not turn with
+#: the simulated head, so "still there" means still on the same side -- the
+#: same side the first look reported and the robot aimed at.
+STILL_THERE = {"found": True, "location": "left", "confident": True}
 
 
 def sighting_json(**overrides) -> str:
@@ -234,10 +238,10 @@ def test_a_well_formed_sighting_becomes_a_record():
     assert sighting.confident is True
     # Good enough to turn towards...
     assert sighting.actionable is True
-    # ...and deliberately not good enough to light: the light only comes on for
-    # a target the turn actually centred. See section 12.
-    assert sighting.verified is False
-    assert parse_sighting(sighting_json(location="center")).verified is True
+    # ...and good enough to light only when it matches what was aimed at.
+    # See section 12.
+    assert sighting.matches_expected_location("left") is True
+    assert sighting.matches_expected_location("right") is False
 
 
 @pytest.mark.parametrize("location", LOCATIONS)
@@ -535,15 +539,16 @@ def test_a_goal_runs_locate_then_move_then_locate_then_light():
     assert lamp.calls == []  # nothing has moved yet
 
     ORIENTATIONS[first.sighting.location](lamp)
-    assert session.oriented() is True
+    assert session.oriented(first.sighting.location) is True
     assert session.stage == STAGE_MOVED
+    assert session.expected_location == "left"
     assert lamp.light is False  # ...and nothing is lit yet either
 
     # Second fresh frame, after the movement.
     assert session.supply_frame(b"frame-two") is True
     second = session.poll()
     assert second.stage == STAGE_VERIFY
-    assert second.sighting.verified is True
+    assert second.sighting.matches_expected_location(session.expected_location) is True
 
     lamp.light_on()
     assert lamp.calls == ["look_left", "light_on"]
@@ -566,8 +571,10 @@ def test_the_session_will_not_verify_before_the_robot_has_moved():
     assert len(brain.calls) == 1
 
     # ...and `oriented` is only legal straight after the first look.
-    assert session.oriented() is True
-    assert session.oriented() is False
+    assert session.oriented("left") is True
+    assert session.oriented("left") is False
+    # ...and only for a side the robot can actually turn towards.
+    assert session.expected_location == "left"
 
 
 def test_a_second_goal_is_refused_while_one_is_running():
@@ -630,7 +637,7 @@ def test_both_vision_calls_run_on_a_worker_thread():
     session.request(MUG, 1)
     session.supply_frame(b"frame-one")
     assert _await_goal(session).stage == STAGE_LOCATE
-    session.oriented()
+    session.oriented("left")
     session.supply_frame(b"frame-two")
     assert _await_goal(session).stage == STAGE_VERIFY
 
@@ -1136,7 +1143,7 @@ def test_a_result_is_not_consumable_until_the_worker_has_cleared_busy():
     assert session.busy is False
     # The transition that used to be silently refused now succeeds, so the
     # goal is not left permanently active.
-    assert session.oriented() is True
+    assert session.oriented("left") is True
     assert session.supply_frame(b"frame-two") is True
     assert _await_goal(session).stage == STAGE_VERIFY
     assert session.hold(goal_module.found_line("mug")) is True
@@ -1868,113 +1875,223 @@ def test_disengaging_during_the_closing_speech_still_puts_the_light_out(capsys):
 
 
 # --------------------------------------------------------------------------
-# 12. The second look must confirm the turn actually worked
+# 12. The second look confirms consistency, not aim
 # --------------------------------------------------------------------------
 #
-# "Find my water bottle and shine your light ON IT". Hardware testing moved the
-# bottle across the desk while the head was turning: the second look still said
-# found+confident, and the lamp lit an empty patch of desk. Being visible
-# somewhere is not the same as being under the light.
+# The camera is the laptop's webcam and it is bolted to the laptop. Turning the
+# *simulated* lamp head does not turn it, so a bottle on the right is still on
+# the right after look_right -- that is the correct answer. What the second
+# look proves is that the desk has not changed under the aim: same object, same
+# side, still sure. Hardware testing found a bottle moved across the desk
+# mid-gesture; that now comes back as the opposite side and fails.
 
 
-def test_alignment_is_a_member_of_the_existing_location_enum():
-    """No new tolerance concept: it is one of the four words we already had."""
-    assert goal_module.ALIGNED_LOCATION == "center"
-    assert goal_module.ALIGNED_LOCATION in LOCATIONS
-    assert goal_module.ALIGNED_LOCATION in ORIENTATIONS
+def test_the_expectation_is_one_word_from_the_existing_location_enum():
+    """No coordinates, no angles, no image: one word the robot acted on."""
+    session = _active_session()
+    session.supply_frame(b"frame-one")
+    session.poll()
+    session.oriented("left")
+
+    assert session.expected_location == "left"
+    assert session.expected_location in LOCATIONS
+    assert session.expected_location in ORIENTATIONS
+
+
+def test_orientation_state_only_accepts_a_side_the_robot_can_turn_towards():
+    session = _active_session()
+    session.supply_frame(b"frame-one")
+    session.poll()
+
+    assert session.oriented("unknown") is False
+    assert session.oriented("somewhere") is False
+    assert session.expected_location is None
+    assert session.stage == STAGE_LOCATE  # not advanced by a refused transition
 
 
 @pytest.mark.parametrize(
-    "second, expected",
+    "second, expected_side, verified",
     [
-        ({"found": True, "location": "center", "confident": True}, True),
-        ({"found": True, "location": "left", "confident": True}, False),
-        ({"found": True, "location": "right", "confident": True}, False),
-        ({"found": True, "location": "unknown", "confident": True}, False),
-        ({"found": True, "location": "center", "confident": False}, False),
-        ({"found": False, "location": "center", "confident": True}, False),
+        ({"found": True, "location": "left", "confident": True}, "left", True),
+        ({"found": True, "location": "right", "confident": True}, "right", True),
+        ({"found": True, "location": "center", "confident": True}, "center", True),
+        ({"found": True, "location": "right", "confident": True}, "left", False),
+        ({"found": True, "location": "left", "confident": True}, "right", False),
+        ({"found": True, "location": "center", "confident": True}, "left", False),
+        ({"found": True, "location": "unknown", "confident": True}, "left", False),
+        ({"found": True, "location": "left", "confident": False}, "left", False),
+        ({"found": False, "location": "left", "confident": True}, "left", False),
+        ({"found": True, "location": "left", "confident": True}, "unknown", False),
+        ({"found": True, "location": "left", "confident": True}, None, False),
     ],
-    ids=["centred", "drifted-left", "drifted-right", "unknown", "unsure", "gone"],
+    ids=[
+        "left-stayed-left",
+        "right-stayed-right",
+        "center-stayed-center",
+        "left-became-right",
+        "right-became-left",
+        "left-became-center",
+        "position-lost",
+        "unsure",
+        "gone",
+        "expected-unknown",
+        "no-expectation",
+    ],
 )
-def test_only_a_centred_sighting_is_verified(second, expected):
-    assert parse_sighting(json.dumps(second)).verified is expected
+def test_a_sighting_matches_only_the_side_that_was_aimed_at(second, expected_side, verified):
+    assert parse_sighting(json.dumps(second)).matches_expected_location(
+        expected_side
+    ) is verified
 
 
-def _run_two_look_goal(monkeypatch, first, second):
+def _run_two_look_goal(monkeypatch, first_location, second, confident=True, found=True):
     """Drive the whole loop with a scripted first and second sighting."""
-    brain = _LocatingBrain(json.dumps(first), json.dumps(second))
+    brain = _LocatingBrain(
+        sighting_json(location=first_location),
+        json.dumps({"found": found, "location": second, "confident": confident}),
+    )
     log, player = _run_goal_demo(monkeypatch, brain)
     return brain, log, player
 
 
 @pytest.mark.parametrize(
-    "first, turn",
-    [
-        ({"found": True, "location": "left", "confident": True}, "look_left"),
-        ({"found": True, "location": "right", "confident": True}, "look_right"),
-    ],
-    ids=["from-the-left", "from-the-right"],
+    "side, turn",
+    [("left", "look_left"), ("right", "look_right"), ("center", "engage")],
+    ids=["left-stayed-left", "right-stayed-right", "center-stayed-center"],
 )
-def test_a_target_centred_by_the_turn_lights_up(monkeypatch, capsys, first, turn):
-    brain, log, player = _run_two_look_goal(
-        monkeypatch, first, {"found": True, "location": "center", "confident": True}
-    )
+def test_a_target_that_stayed_put_lights_up(monkeypatch, capsys, side, turn):
+    brain, log, player = _run_two_look_goal(monkeypatch, side, side)
     out = capsys.readouterr().out
 
     assert len(brain.calls) == 2
-    assert [entry for entry in log if entry in (turn, "light_on")] == [turn, "light_on"]
-    assert "centred on a second, fresh frame" in out
+    assert turn in log
+    assert log.index(turn) < log.index("light_on")
+    assert f"still {side} on a second, fresh frame" in out
     assert brain.spoken == [goal_module.found_line("mug")]
     assert player.played == [b"speech"]
 
 
 @pytest.mark.parametrize(
-    "first, turn, second_location",
+    "first_side, turn, second, kwargs",
     [
-        # Turned left, but the bottle was moved to the other side meanwhile.
-        ({"found": True, "location": "left", "confident": True}, "look_left", "right"),
-        # ...and the mirror image.
-        ({"found": True, "location": "right", "confident": True}, "look_right", "left"),
+        # The bottle was moved to the other side while the lamp was turning.
+        ("left", "look_left", "right", {}),
+        ("right", "look_right", "left", {}),
         # Still visible, but the model cannot say where any more.
-        ({"found": True, "location": "left", "confident": True}, "look_left", "unknown"),
+        ("left", "look_left", "unknown", {}),
+        # Still on the same side, but the model is no longer sure.
+        ("left", "look_left", "left", {"confident": False}),
+        # Taken away entirely.
+        ("right", "look_right", "unknown", {"found": False}),
     ],
-    ids=["moved-to-the-right", "moved-to-the-left", "position-lost"],
+    ids=[
+        "moved-to-the-right",
+        "moved-to-the-left",
+        "position-lost",
+        "no-longer-sure",
+        "taken-away",
+    ],
 )
-def test_a_target_that_moved_during_the_turn_does_not_light_up(
-    monkeypatch, capsys, first, turn, second_location
+def test_a_target_that_changed_during_the_turn_does_not_light_up(
+    monkeypatch, capsys, first_side, turn, second, kwargs
 ):
-    """found + confident is no longer enough; it has to be under the head."""
-    brain, log, player = _run_two_look_goal(
-        monkeypatch,
-        first,
-        {"found": True, "location": second_location, "confident": True},
-    )
+    """found + confident is not enough; it has to be where the robot aimed."""
+    brain, log, player = _run_two_look_goal(monkeypatch, first_side, second, **kwargs)
     out = capsys.readouterr().out
 
     assert len(brain.calls) == 2          # it did look again...
     assert turn in log                    # ...and it did turn...
     assert "light_on" not in log          # ...but the light stayed off.
-    assert "not centred under the head" in out
+    assert "moved since I aimed" in out
     assert brain.spoken == [goal_module.lost_line("mug")]
     assert player.played == [b"speech"]
 
 
-def test_a_failed_alignment_ends_the_goal_cleanly(monkeypatch, capsys):
-    """No stuck goal, no light, and only one orientation attempt."""
-    brain = _LocatingBrain(
-        sighting_json(location="left"),
-        sighting_json(location="right"),
-    )
+def test_the_expected_side_is_cleared_after_a_successful_goal(monkeypatch, capsys):
+    brain = _LocatingBrain(sighting_json(), json.dumps(STILL_THERE))
     log = _spy_lamp(monkeypatch)
     player = _GoalPlayer()
     goals = _inline_goal_session(brain, player)
-    turn = GoalTurn()
 
     engagement_demo.run(
         preview=False,
         headless=True,
         sensor=_FrameSensor([(True, 8.0)]),
-        voice_factory=lambda _lamp: turn,
+        voice_factory=lambda _lamp: GoalTurn(),
+        talk_key=ScriptedTalkKey(40),
+        goals=goals,
+        player=player,
+    )
+    capsys.readouterr()
+
+    assert "light_on" in log              # it did succeed...
+    assert goals.active is False
+    assert goals.expected_location is None  # ...and it kept nothing
+
+
+def test_the_expected_side_is_cleared_after_a_failed_goal(monkeypatch, capsys):
+    brain, log, _player = _run_two_look_goal(monkeypatch, "left", "right")
+    capsys.readouterr()
+
+    assert "light_on" not in log
+    # `_run_goal_demo` builds its own session, so assert the same thing through
+    # a session this test still holds.
+    session = _active_session()
+    session.supply_frame(b"frame-one")
+    session.poll()
+    session.oriented("left")
+    assert session.expected_location == "left"
+    session.finish()
+    assert session.expected_location is None
+
+
+def test_the_expected_side_is_cleared_when_a_goal_is_abandoned(capsys):
+    session = _active_session()
+    lamp = GoalLamp()
+    session.supply_frame(b"frame-one")
+    engagement_demo._handle_goal(
+        session.poll(), session, lamp, _GoalPlayer(), _NoFlush(), _Engaged(), 1
+    )
+    assert session.expected_location == "left"
+
+    engagement_demo._abandon_goal(session, lamp, "the person left")
+    capsys.readouterr()
+
+    assert session.expected_location is None
+
+
+def test_a_new_goal_cannot_inherit_the_previous_goals_expected_side():
+    """A stale expectation would light the lamp for the wrong evidence."""
+    session = _active_session()
+    session.supply_frame(b"frame-one")
+    session.poll()
+    session.oriented("left")
+    assert session.expected_location == "left"
+
+    session.finish()
+    assert session.request(Goal(kind="find_and_light", target="bottle"), 2) is True
+    assert session.expected_location is None
+    # ...so a second look of "left" cannot be verified against nothing.
+    assert (
+        parse_sighting(sighting_json(location="left")).matches_expected_location(
+            session.expected_location
+        )
+        is False
+    )
+
+
+def test_a_failed_verification_ends_the_goal_cleanly_with_one_turn(monkeypatch, capsys):
+    """No stuck goal, no light, and exactly one orientation attempt."""
+    brain = _LocatingBrain(sighting_json(location="left"), sighting_json(location="right"))
+    log = _spy_lamp(monkeypatch)
+    player = _GoalPlayer()
+    goals = _inline_goal_session(brain, player)
+
+    engagement_demo.run(
+        preview=False,
+        headless=True,
+        sensor=_FrameSensor([(True, 8.0)]),
+        voice_factory=lambda _lamp: GoalTurn(),
         talk_key=ScriptedTalkKey(40),
         goals=goals,
         player=player,
@@ -1983,13 +2100,14 @@ def test_a_failed_alignment_ends_the_goal_cleanly(monkeypatch, capsys):
 
     assert goals.active is False
     assert goals.occupied is False
+    assert goals.expected_location is None
     assert log.count("look_left") == 1     # exactly one orientation attempt
     assert "look_right" not in log         # ...and no corrective second try
     assert "light_on" not in log
     assert log[-1] == "light_off"
 
 
-def test_a_non_centred_second_look_is_reported_at_the_handler(capsys):
+def test_a_mismatched_second_look_is_reported_at_the_handler(capsys):
     brain = _LocatingBrain(sighting_json(location="left"), sighting_json(location="right"))
     session = _inline_goal_session(brain)
     lamp = GoalLamp()
@@ -1998,14 +2116,17 @@ def test_a_non_centred_second_look_is_reported_at_the_handler(capsys):
     engagement_demo._handle_goal(
         session.poll(), session, lamp, _GoalPlayer(), _NoFlush(), _Engaged(), 1
     )
+    assert session.expected_location == "left"
+
     session.supply_frame(b"frame-two")
     engagement_demo._handle_goal(
         session.poll(), session, lamp, _GoalPlayer(), _NoFlush(), _Engaged(), 1
     )
-    capsys.readouterr()
+    out = capsys.readouterr().out
 
     assert lamp.light is False
     assert "light_on" not in lamp.calls
+    assert "aimed left" in out
     assert session.held is True            # the failure line is queued, not lost
     assert session.line == goal_module.lost_line("mug")
 

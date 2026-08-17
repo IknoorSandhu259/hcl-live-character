@@ -9,8 +9,13 @@ deliberately only one:
         --> fresh frame  -> CharacterBrain.locate(jpeg, "mug")
         --> found + left/center/right
         --> ORIENTATIONS[location](lamp)                  (a named gesture)
-        --> A SECOND fresh frame -> locate(jpeg, "mug")   (still there?)
+        --> A SECOND fresh frame -> locate(jpeg, "mug")   (same object, same side?)
         --> lamp.light_on()
+
+The camera is the laptop's and does not move with the simulated head, so the
+second look is a *consistency* check, not an aiming check: the target must
+still be there, still on the side the robot aimed at, and still certain. See
+:meth:`TargetSighting.matches_expected_location`.
 
 Three things are the point of the file.
 
@@ -167,12 +172,6 @@ def parse_goal(payload: object) -> Goal:
 
 SIGHTING_FIELDS = ("found", "location", "confident")
 
-#: Where the target has to be on the *second* look for the goal to complete.
-#: A member of the existing location enum, not a new tolerance concept: the
-#: head is pointing at the middle of the frame, so "centre" is the coarse
-#: schema's own way of saying "the light is on it".
-ALIGNED_LOCATION = "center"
-
 
 @dataclass(frozen=True)
 class TargetSighting:
@@ -194,26 +193,34 @@ class TargetSighting:
         """
         return self.found and self.confident and self.location in ORIENTATIONS
 
-    @property
-    def verified(self) -> bool:
+    def matches_expected_location(self, expected: Optional[str]) -> bool:
         """True only if this sighting may cause the light to come on.
 
-        "Still there somewhere" is not what the goal promised. The person asked
-        for the light to be *on* the object, so the second look has to confirm
-        the orientation actually worked: the target must be in the middle third
-        of the frame, which is where the head is now pointing.
+        Deliberately not a context-free property: what counts as a good second
+        look depends on the first one. *expected* is the coarse location that
+        caused the orientation -- :attr:`GoalSession.expected_location`.
 
-        This is what catches an object that moved during the turn. Hardware
-        testing found a bottle picked up mid-gesture and put down on the other
-        side of the desk: it was still found, still confidently placed, and the
-        lamp lit an empty patch of desk. A sighting of ``left`` or ``right``
-        after the turn now means the goal failed.
+        The camera is the laptop's, and it is bolted to the laptop. Turning the
+        simulated lamp head does not turn it, so a bottle that was on the right
+        is *still* on the right in the frame after ``look_right`` -- that is the
+        correct answer, not a failure. What the second look proves is that the
+        desk has not changed under the aim: same object, same side, still sure.
 
-        One turn, then a strict check. Nothing here re-aims: a second corrective
-        gesture would need the tracking and tolerance machinery this milestone
-        deliberately does not have.
+        So a bottle picked up mid-gesture and put down on the other side comes
+        back as ``left`` against an expected ``right``, and the goal fails
+        rather than lighting an empty patch of desk. One turn, then this check.
+        Nothing here re-aims: a corrective gesture would need the tracking this
+        milestone deliberately does not have.
         """
-        return self.found and self.confident and self.location == ALIGNED_LOCATION
+        return (
+            self.found
+            and self.confident
+            # `expected` is one of the three we can actually turn towards, so
+            # an absent or 'unknown' expectation can never be matched -- and
+            # neither can an 'unknown' sighting, since it is not a key here.
+            and expected in ORIENTATIONS
+            and self.location == expected
+        )
 
     def summary(self) -> str:
         if not self.found:
@@ -281,13 +288,6 @@ if set(ORIENTATIONS) | {"unknown"} != set(LOCATIONS):
         f"contract {sorted(LOCATIONS)}"
     )
 
-if ALIGNED_LOCATION not in ORIENTATIONS:
-    # The location the second look must report is the one the head ends up
-    # facing, so it has to be a real member of the same enum.
-    raise RuntimeError(
-        f"{ALIGNED_LOCATION!r} is not one of the orientations {sorted(ORIENTATIONS)}"
-    )
-
 
 # --------------------------------------------------------------------------
 # What the character says about it
@@ -304,8 +304,8 @@ def found_line(target: str) -> str:
 
 def lost_line(target: str) -> str:
     # Covers both ways the second look can fail: the target is gone, or it is
-    # still there but no longer where my light is pointing.
-    return f"I turned, but I can't get my light onto your {target}. I'll leave it off."
+    # no longer where it was when I aimed at it.
+    return f"Your {target} has moved since I aimed at it. I'll leave my light off."
 
 
 def missing_line(target: str) -> str:
@@ -391,6 +391,12 @@ class GoalSession:
         #: The closing sentence, written as soon as the outcome is known and
         #: rendered once the lamp's speaker is free.
         self.line = ""
+        #: The coarse location the first look reported and the head turned
+        #: towards, or None. The whole of what this goal remembers between its
+        #: two looks: one word out of the location enum. No image, no
+        #: coordinates, no angle. Cleared when a goal starts and when one ends,
+        #: so a later goal can never inherit it.
+        self.expected_location: Optional[str] = None
 
     # -- state -------------------------------------------------------------
 
@@ -441,6 +447,7 @@ class GoalSession:
         self.stage = STAGE_PENDING
         self.looks = 0
         self.line = ""
+        self.expected_location = None
         return True
 
     def supply_frame(self, jpeg: bytes) -> bool:
@@ -458,15 +465,23 @@ class GoalSession:
         self._start(next_stage, lambda: self._brain.locate(jpeg, target))
         return True
 
-    def oriented(self) -> bool:
-        """Record that the named orientation behaviour has been played.
+    def oriented(self, location: str) -> bool:
+        """Record that the named orientation behaviour for *location* has played.
 
         Only legal straight after the first look, and it is the *only* way to
         reach the verification stage -- which is what makes the second frame
         mandatory rather than merely usual.
+
+        *location* is the coarse word the first look reported and that chose the
+        gesture; it is kept so the second look can be compared against it. Only
+        the three we can actually turn towards are accepted, so the expectation
+        can never be something the robot did not act on.
         """
         if self.stage != STAGE_LOCATE or self.busy:
             return False
+        if location not in ORIENTATIONS:
+            return False
+        self.expected_location = location
         self.stage = STAGE_MOVED
         return True
 
@@ -504,6 +519,7 @@ class GoalSession:
         self.stage = None
         self.goal = NO_GOAL
         self.line = ""
+        self.expected_location = None
 
     def poll(self) -> Optional[GoalOutcome]:
         """Non-blocking: the finished step, or None. Control thread only.

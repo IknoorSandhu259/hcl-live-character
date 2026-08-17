@@ -25,8 +25,11 @@ And while ENGAGED, ask out loud for the one goal the character can act on --
 "find my mug and shine your light on it". That is not recall: it takes a fresh
 frame, looks for that specific object, turns towards the side it is on with a
 named gesture, takes a SECOND fresh frame after turning, and only lights the
-bulb if the object is still confidently there. Anything less and the light
-stays off and the character says so.
+bulb if the object is still confidently on the side it aimed at. The camera is
+the laptop's and does not turn with the simulated head, so that second look is
+a consistency check -- it catches the object being moved or taken away while
+the lamp was turning. Anything less and the light stays off and the character
+says so.
 
 This file is the *wiring* only, and is deliberately thin:
 
@@ -552,29 +555,35 @@ def _handle_goal(
         if not _fresh_capture_boundary(sensor):
             _abandon_goal(goals, lamp, "the camera is not provably past the turn")
             return
-        if not goals.oriented():
+        # The side the first look reported is what the head was aimed at, so it
+        # is what the second look has to agree with.
+        if not goals.oriented(sighting.location):
             _abandon_goal(goals, lamp, "the session refused the movement step")
         return
 
     if outcome.stage == STAGE_VERIFY:
-        if not sighting.verified:
-            # Gone, unsure, or still visible but off to one side -- which is
-            # what a target moved during the turn looks like. One orientation
-            # attempt is all this milestone makes; there is no second try.
+        expected = goals.expected_location
+        if not sighting.matches_expected_location(expected):
+            # Gone, unsure, or somewhere other than where the robot aimed --
+            # which is what a target moved during the turn looks like. One
+            # orientation attempt is all this milestone makes; no second try.
             _log(
-                f"second look: {sighting.summary()} -- not centred under the head, "
-                "leaving the light off"
+                f"second look: {sighting.summary()}, aimed {expected} -- the target "
+                "moved since I aimed; leaving the light off"
             )
             _fail_goal(
                 goals, lamp, goals_module.lost_line(outcome.target), "verification failed"
             )
             return
-        # Two independent looks, the second one after the head moved, both
-        # confident, and the target centred in the new frame. Only now.
+        # Two independent looks, the second one after the head moved and from a
+        # frame captured past the freshness boundary, both confident, and the
+        # target still on the side that was aimed at. Only now.
         if not _physical("turning the light on", lamp.light_on):
             _abandon_goal(goals, lamp, "the light would not come on")
             return
-        _log(f"light ON: {outcome.target} centred on a second, fresh frame")
+        _log(
+            f"light ON: {outcome.target} still {expected} on a second, fresh frame"
+        )
         if not goals.hold(goals_module.found_line(outcome.target)):
             # The goal is physically complete; only the sentence is lost. Leave
             # the light on -- it is the intended successful final state -- but
