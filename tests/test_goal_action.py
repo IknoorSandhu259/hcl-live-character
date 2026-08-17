@@ -38,6 +38,7 @@ import audio_io  # noqa: E402
 import character  # noqa: E402
 import engagement_demo  # noqa: E402
 import goal as goal_module  # noqa: E402
+import media_cues  # noqa: E402
 import robot_controller  # noqa: E402
 import voice_turn  # noqa: E402
 from attention import AttentionSensor  # noqa: E402
@@ -77,6 +78,13 @@ from test_voice_turn import (  # noqa: E402
 )
 
 FOUND_LEFT = {"found": True, "location": "left", "confident": True}
+
+#: The two Hour 6 cues, as the shared player sees them. They travel down the
+#: same ``prepare``/``play`` interface as speech, so anything driving the whole
+#: loop through a recording player sees them in ``played`` alongside the words:
+#: ACK once per IDLE -> ENGAGED, MUSIC only after a verified, lit goal.
+ACK = media_cues.engagement_ack_wav()
+MUSIC = media_cues.goal_success_wav()
 
 #: What a *successful* second look says. The laptop camera does not turn with
 #: the simulated head, so "still there" means still on the same side -- the
@@ -843,7 +851,7 @@ def test_the_light_comes_on_only_after_a_second_fresh_look(monkeypatch, capsys):
     assert log.index("look_left") < log.index("light_on")
     assert "light ON" in out
     assert brain.spoken == [goal_module.found_line("mug")]
-    assert player.played == [b"speech"]
+    assert player.played == [ACK, MUSIC, b"speech"]
 
 
 def test_the_second_frame_is_captured_after_the_head_moved(monkeypatch):
@@ -1561,10 +1569,13 @@ def test_the_closing_line_waits_for_the_reply_to_finish_playing(monkeypatch, cap
     assert len(brain.calls) == 2
     assert "light_on" in log
     # ...but the closing sentence was never prepared on the shared player,
-    # because the reply was still coming out of it.
+    # because the reply was still coming out of it. Nor was the success music,
+    # which waits behind the same deadline; only the engagement cue, which
+    # played before the turn started, is there.
     assert brain.spoken == []
-    assert player.played == []
+    assert player.played == [ACK]
     assert goals.held is True
+    assert goals.music_pending is True
 
 
 def test_the_closing_line_is_spoken_once_the_speaker_is_free(monkeypatch, capsys):
@@ -1573,7 +1584,7 @@ def test_the_closing_line_is_spoken_once_the_speaker_is_free(monkeypatch, capsys
     capsys.readouterr()
 
     assert brain.spoken == [goal_module.found_line("mug")]
-    assert player.played == [b"speech"]
+    assert player.played == [ACK, MUSIC, b"speech"]
 
 
 def test_goal_closing_playback_extends_the_shared_quiet_deadline():
@@ -1968,7 +1979,7 @@ def test_a_target_that_stayed_put_lights_up(monkeypatch, capsys, side, turn):
     assert log.index(turn) < log.index("light_on")
     assert f"still {side} on a second, fresh frame" in out
     assert brain.spoken == [goal_module.found_line("mug")]
-    assert player.played == [b"speech"]
+    assert player.played == [ACK, MUSIC, b"speech"]
 
 
 @pytest.mark.parametrize(
@@ -2004,7 +2015,9 @@ def test_a_target_that_changed_during_the_turn_does_not_light_up(
     assert "light_on" not in log          # ...but the light stayed off.
     assert "moved since I aimed" in out
     assert brain.spoken == [goal_module.lost_line("mug")]
-    assert player.played == [b"speech"]
+    # The engagement cue and the spoken failure, and no success music between
+    # them: an unverified goal has not earned it.
+    assert player.played == [ACK, b"speech"]
 
 
 def test_the_expected_side_is_cleared_after_a_successful_goal(monkeypatch, capsys):

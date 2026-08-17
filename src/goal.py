@@ -323,7 +323,9 @@ def missing_line(target: str) -> str:
 #   LOCATE  -> [worker: vision call]        -> control thread plays a gesture
 #   MOVED   -> [control thread grabs ANOTHER fresh frame, a tick later]
 #   VERIFY  -> [worker: vision call]        -> control thread turns the light on
-#   HOLD    -> [control thread waits for the lamp's speaker to be free]
+#   HOLD    -> [control thread waits for the lamp's speaker to be free, then
+#               plays the success flourish if this goal earned one and waits
+#               again for it to finish]
 #   SPEAK   -> [worker: text-to-speech]     -> control thread plays the audio
 #
 # MOVED exists so the second frame cannot be the first one: the session refuses
@@ -397,6 +399,13 @@ class GoalSession:
         #: coordinates, no angle. Cleared when a goal starts and when one ends,
         #: so a later goal can never inherit it.
         self.expected_location: Optional[str] = None
+        #: True between "this goal verified its target and the light is on" and
+        #: "the success flourish has been played (or could not be)". One bit,
+        #: set by :meth:`succeeded` and cleared by :meth:`music_played`, and
+        #: cleared again whenever a goal starts or ends so an unsuccessful goal
+        #: can never inherit it. It is what keeps the closing sentence waiting
+        #: behind the music.
+        self.music_pending = False
 
     # -- state -------------------------------------------------------------
 
@@ -448,6 +457,7 @@ class GoalSession:
         self.looks = 0
         self.line = ""
         self.expected_location = None
+        self.music_pending = False
         return True
 
     def supply_frame(self, jpeg: bytes) -> bool:
@@ -498,6 +508,28 @@ class GoalSession:
         self.stage = STAGE_HOLD
         return True
 
+    def succeeded(self) -> bool:
+        """Arm the one success flourish. Legal only on a goal that is still held.
+
+        Called by the control thread after -- and only after -- the second
+        fresh look agreed with the side that was aimed at and the light
+        actually came on. Nothing else sets this bit, which is why an
+        unsuccessful goal cannot reach the music.
+        """
+        if self.stage != STAGE_HOLD:
+            return False
+        self.music_pending = True
+        return True
+
+    def music_played(self) -> None:
+        """The flourish has been played, or could not be. Idempotent.
+
+        Deliberately indifferent to whether the sound came out: a decorative
+        cue that failed must not strand the goal in HOLD forever, so the
+        closing sentence is released either way.
+        """
+        self.music_pending = False
+
     def say(self) -> bool:
         """Render the held line. Legal only from HOLD, and only when idle."""
         if self.stage != STAGE_HOLD or self.busy:
@@ -520,6 +552,7 @@ class GoalSession:
         self.goal = NO_GOAL
         self.line = ""
         self.expected_location = None
+        self.music_pending = False
 
     def poll(self) -> Optional[GoalOutcome]:
         """Non-blocking: the finished step, or None. Control thread only.

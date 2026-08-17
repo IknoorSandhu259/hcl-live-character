@@ -37,6 +37,8 @@ This file is the *wiring* only, and is deliberately thin:
     attention.EngagementTracker    noisy booleans -> IDLE / ENGAGED  (policy)
     attention.encode_frame_jpeg    one frame -> bounded JPEG bytes
     audio_io                       microphone / speaker              (audio)
+    media_cues.engagement_ack_wav  the acknowledgement SFX, generated locally
+    media_cues.goal_success_wav    the success flourish, generated locally
     character.CharacterBrain       transcript + note -> {reply, behavior}  (language)
                                    one frame -> a scene observation
     scene_memory.SceneMemory       the retained facts, locally owned
@@ -97,6 +99,7 @@ from goal import (  # noqa: E402
     STAGE_VERIFY,
     GoalSession,
 )
+import media_cues  # noqa: E402
 from robot_controller import LampController, load_lamp  # noqa: E402
 from scene_memory import ObservationSession, SceneMemory  # noqa: E402
 from voice_turn import TurnError, VoiceSession, VoiceTurn  # noqa: E402
@@ -429,6 +432,46 @@ def _physical(label: str, call, *args) -> bool:
     return True
 
 
+def _speaker_free(session, goals, now: float) -> bool:
+    """True when nothing else owns the shared speaker right now.
+
+    "Owns" is wider than "is making a noise": a voice worker mid-``prepare``
+    and a goal worker rendering its closing line are both about to hand the
+    same player audio, and the player is not safe to prepare twice at once.
+    A decorative cue is the one thing here that is worth simply skipping, so
+    it asks this before it plays and stays quiet if the answer is no.
+    """
+    if session is not None and (session.busy or session.speaking(now)):
+        return False
+    if goals is not None and goals.occupied:
+        return False
+    return True
+
+
+def _play_cue(player, session, wav_bytes: bytes, label: str) -> bool:
+    """Play one local cue through the shared speaker. Reports, never raises.
+
+    Goes down the same ``prepare``/``play`` interface as every spoken reply,
+    and extends the same quiet deadline on the way out, so the microphone stays
+    shut for exactly as long as the sound lasts. A cue that cannot be prepared
+    or played is logged and shrugged off: neither engagement nor a completed
+    goal is allowed to depend on a decoration.
+    """
+    if player is None:
+        return False
+    try:
+        prepared = player.prepare(wav_bytes)
+        player.play(prepared)
+    except Exception as exc:  # noqa: BLE001 - a failed speaker is not a dead demo
+        _log(f"could not play the {label}: {_describe(exc)}", error=True)
+        return False
+    if session is not None:
+        # One lamp, one mouth, one deadline -- the same one an ordinary reply
+        # and the goal's closing sentence extend.
+        session.mark_speaking(prepared.seconds, time.monotonic())
+    return True
+
+
 def _light_off(lamp) -> bool:
     """Put the light out, reporting rather than raising. The safe state."""
     return _physical("turning the light off", lamp.light_off)
@@ -590,6 +633,12 @@ def _handle_goal(
             # release the session so later turns are not blocked forever.
             _log("could not queue the closing line; finishing the goal quietly", error=True)
             goals.finish()
+            return
+        # Found, aimed at, verified against a second fresh frame, and lit. This
+        # is the only call site: the flourish is armed by the same branch that
+        # turned the light on, and by nothing else. The loop plays it once the
+        # shared speaker is free, before the closing sentence.
+        goals.succeeded()
         return
 
     _abandon_goal(goals, lamp, f"unexpected stage {outcome.stage!r}")
@@ -728,6 +777,17 @@ def run(
                 epoch += 1
                 print(f"[{time.strftime('%H:%M:%S')}] IDLE -> ENGAGED")
                 lamp.engage()
+                # Motion and sound together: the character notices you with its
+                # body and its voice box at the same moment. Deliberately after
+                # the pose command and deliberately unchecked -- noticing
+                # someone does not depend on a speaker.
+                if _speaker_free(session, goals, time.monotonic()):
+                    _play_cue(
+                        player,
+                        session,
+                        media_cues.engagement_ack_wav(),
+                        "engagement acknowledgement",
+                    )
                 sensor.flush()
             elif transition is EngagementState.IDLE:
                 print(f"[{time.strftime('%H:%M:%S')}] ENGAGED -> IDLE")
@@ -817,7 +877,18 @@ def run(
             # while it is still reading the staged audio of the turn's reply.
             if goals is not None and goals.held:
                 if session is not None and session.speaking(time.monotonic()):
-                    pass  # still mid-sentence; try again next tick
+                    pass  # still mid-sentence (or mid-flourish); try next tick
+                elif goals.music_pending:
+                    # The speaker is free and this goal earned the flourish, so
+                    # it goes out now -- between the light coming on and the
+                    # sentence that reports it. Playing it marks the shared
+                    # deadline, so the branch above holds the closing line back
+                    # until the music has finished; a cue that failed is
+                    # reported by _play_cue and simply does not extend it.
+                    _play_cue(
+                        player, session, media_cues.goal_success_wav(), "success music"
+                    )
+                    goals.music_played()
                 elif not goals.say():
                     _abandon_goal(goals, lamp, "the closing line could not be started")
 
