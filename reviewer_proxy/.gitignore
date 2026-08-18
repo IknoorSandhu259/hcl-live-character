@@ -1,0 +1,8 @@
+# Never commit a credential. The real key lives only in Vercel's environment
+# variable store; the reviewer token is handed over out of band.
+.env
+.env.*
+!.env.example
+
+.vercel/
+node_modules/

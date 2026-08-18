@@ -1,0 +1,13 @@
+{
+  "name": "hcl-reviewer-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional narrow OpenAI relay so HCL reviewers can run the lamp demo on my quota without receiving my API key.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
