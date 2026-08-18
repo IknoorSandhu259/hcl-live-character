@@ -8,10 +8,13 @@ asked out loud to find that object and shine its light on it. The **bulb is
 reserved for a successfully verified goal** — it is not part of the greeting,
 and music plays only when such a goal completes.
 
-The challenge brief is [`CHALLENGE.md`](CHALLENGE.md); the supplied deliverables
-and evaluation criteria are in [`SUBMISSION.md`](SUBMISSION.md). Measurement
-procedures and the place to record the numbers are in
-[`MEASUREMENTS.md`](MEASUREMENTS.md).
+- [`TECHNICAL_NOTE.md`](TECHNICAL_NOTE.md) — the ≤2-page technical note:
+  architecture, protocol, design choices, measurements, limitations.
+- [`MEASUREMENTS.md`](MEASUREMENTS.md) — the measurement procedures and the
+  collected numbers.
+- [`CHALLENGE.md`](CHALLENGE.md) — the challenge brief.
+- [`SUBMISSION.md`](SUBMISSION.md) — the supplied deliverables and evaluation
+  criteria.
 
 ## Requirements
 
@@ -25,9 +28,11 @@ Hardware and services:
 - **Microphone** and **speaker** on the standard Linux audio stack
   (PipeWire/PulseAudio on a stock 24.04 desktop, or bare ALSA).
 - **Wi-Fi / internet**, because speech-to-text, character reasoning,
-  text-to-speech and the two vision calls are cloud calls.
-- An **`OPENAI_API_KEY`**. Only [`src/character.py`](src/character.py) talks to
-  OpenAI; nothing else in the tree makes a network call.
+  text-to-speech and the vision calls are cloud calls.
+- **Credentials.** Use the temporary reviewer token supplied with this
+  submission — no OpenAI key of your own is needed (see *Setup*). Only
+  [`src/character.py`](src/character.py) talks to OpenAI; nothing else in the
+  tree makes a network call.
 
 Python packages are declared in [`requirements.txt`](requirements.txt) (runtime)
 and [`requirements-dev.txt`](requirements-dev.txt) (adds pytest). They are the
@@ -46,6 +51,9 @@ sudo apt install python3-venv python3-dev build-essential libgl1 libportaudio2 p
   toolchain. PyBullet may have to compile from source when no wheel matching
   this Python version and platform is available, and without these that install
   fails. They cost nothing when a usable wheel *is* published.
+- `libgl1` — provides `libGL.so.1`, which the `opencv-python` wheel links
+  against. Confirmed necessary: without it, `import cv2` fails on a clean
+  Ubuntu 24.04 image.
 - `libportaudio2` — the shared library behind `sounddevice`, used to record.
   The wheel does not bundle it; without it recording fails with an explicit
   "PortAudio could not be loaded" message.
@@ -65,9 +73,8 @@ sudo apt install alsa-utils        # provides aplay
 
 The player is chosen at startup: the code looks for `paplay` first, then
 `aplay`, and falls back to in-process PortAudio/`sounddevice` when neither is
-found. That fallback is a real code path rather than a guess, but it has **not
-been exercised on Ubuntu 24.04 hardware** — see *Known limitations and
-validation status* below.
+found. Audio playback has not been exercised on Ubuntu hardware — see *What was
+validated where* below.
 
 No ROS, no Gazebo, no Docker, no GPU runtime, no system-wide install.
 
@@ -97,14 +104,36 @@ python -m pip install -r requirements-dev.txt
 That is a superset — it installs the runtime packages too, so it is also a fine
 single command for a machine that will both run and test.
 
-Provide the credential through the environment, not a file:
+### Credentials — recommended evaluator setup
+
+**You do not need your own OpenAI API key.** A temporary reviewer token is
+supplied privately with this submission. It routes the model calls through a
+small restricted HTTPS proxy running on my evaluation quota:
 
 ```bash
-export OPENAI_API_KEY="sk-..."
+export OPENAI_BASE_URL="https://hcl-reviewer-proxy.vercel.app/v1"
+export OPENAI_API_KEY="<temporary reviewer token supplied privately>"
+python src/engagement_demo.py
 ```
 
-Nothing in the tree reads a `.env`, and the key is redacted from any error
-message the demo prints. Keep it out of the repository.
+That is the whole setup — two environment variables. There is no proxy branch in
+the code: the OpenAI SDK reads `OPENAI_BASE_URL` itself. The proxy is an
+evaluation transport only; it carries model traffic and has no access to robot
+state, `LampController`, joint commands or the local semantic-action validation.
+Its own notes are in [`reviewer_proxy/README.md`](reviewer_proxy/README.md).
+
+### Optional alternative — direct OpenAI mode
+
+If you would rather use your own key, the demo talks to OpenAI directly with no
+proxy in the path:
+
+```bash
+unset OPENAI_BASE_URL
+export OPENAI_API_KEY="<your own OpenAI API key>"
+```
+
+Either way the credential comes from the environment: nothing in the tree reads
+a `.env`, and the value is redacted from any error message the demo prints.
 
 ## Run
 
@@ -122,7 +151,7 @@ Options (all optional):
 | `--camera-index N` | Use another webcam. Default `0`. |
 | `--no-preview` | Hide the OpenCV camera window. The PyBullet window stays. |
 | `--headless` | Run PyBullet with no window (`DIRECT`). No lamp GUI, so no lamp-window keys. |
-| `--no-voice` | Camera and lamp only: no microphone, no speaker, no API key needed. |
+| `--no-voice` | Camera and lamp only: no microphone, no speaker, no credentials needed. |
 
 `--no-voice` is a **diagnostic**, not the submitted interaction. It exercises
 the camera, the engagement policy and the lamp body and nothing else — no
@@ -186,7 +215,7 @@ problem.
 python -m pip install -r requirements-dev.txt   # pytest is NOT in requirements.txt
 python -m pytest
 ```
-The whole behavioural suite. No camera, no microphone, no network, no API key —
+The whole behavioural suite. No camera, no microphone, no network, no credentials —
 every collaborator is faked. This proves the logic: engagement hysteresis, the
 model-to-action allowlist, the two-look goal semantics, the fail-closed light,
 recall separation, camera freshness and speaker ordering. If this fails, nothing
@@ -204,7 +233,8 @@ and no network.
 python src/engagement_demo.py
 ```
 The full interaction, and the only command that exercises the cloud path. It
-needs `OPENAI_API_KEY` and working internet; it also needs a real microphone and
+needs the credential exports from *Setup* and working internet; it also needs a
+real microphone and
 speaker, which `--no-voice` never touches. A failure here that `--no-voice`
 passes is an audio-device, credential or network problem, not a logic one.
 
@@ -242,40 +272,55 @@ What leaves the machine, and when:
 Frames are downscaled to 640 px wide and JPEG-compressed with a hard byte cap
 before any of this, so an upload cannot grow without bound.
 
-## Documentation status
+## Documentation
 
 [`SUBMISSION.md`](SUBMISSION.md) is the **supplied** submission requirements and
-evaluation-criteria document. It is **not** the technical note.
+evaluation-criteria document. It is not the technical note.
 
-The required ≤2-page technical note — the architecture and data-flow diagram,
-the protocol/model-to-action/simulation/deployment design choices, the four
-measurements and the limitations — is **still pending**. It is written in the
-final submission pass, after the measurements in
-[`MEASUREMENTS.md`](MEASUREMENTS.md) have actually been collected on real
-hardware, so that its numbers are measured rather than asserted.
+The required ≤2-page technical note is [`TECHNICAL_NOTE.md`](TECHNICAL_NOTE.md):
+architecture and data-flow diagram, protocol and model-to-action boundary,
+simulation and deployment, design tradeoffs, the measurements and the
+limitations. The raw evidence behind those numbers, with the procedure used to
+collect it, is in [`MEASUREMENTS.md`](MEASUREMENTS.md).
 
-## Known limitations and validation status
+## What was validated where
 
-The behavioural logic is covered by the test suite, which runs entirely on fakes.
-What that suite cannot cover, and what therefore remains unvalidated:
+- **Full interaction on physical macOS hardware (M3 Mac).** Engagement and SFX,
+  push-to-talk voice, explicit scene observation, memory recall,
+  `find_and_light`, second fresh verification, light, success music, closing
+  speech, disengagement and light-off. Reviewer proxy mode was also live-tested
+  here, with a successful spoken turn and a successful `o` observation.
+- **Ubuntu 24.04 ARM64 in a 4-core / 8-GB Multipass VM.** Dependency install,
+  PyBullet built from source on Python 3.12, OpenCV import, the automated test
+  suite, clean missing-camera handling, and headless robot runtime with all 5
+  actuated joints discovered.
+- **Not validated:** physical Ubuntu camera, microphone and speaker, because the
+  VM does not expose those devices.
 
-- **The Ubuntu 24.04 target has not been validated on real target hardware.**
-  The apt list, the PyBullet install path and everything below are reasoned from
-  the code and the packages' documented contents, not observed on a 24.04 box.
-- **Linux audio needs real-hardware validation.** Which backend is selected,
-  and whether the in-process PortAudio fallback is acceptable under the PyBullet
-  GUI, is a property of the machine and has not been tested on the target.
-- **Camera index 0 may not be the right webcam.** USB cameras frequently enumerate
-  at index 1 or higher on Linux; use `--camera-index N`. There is no auto-probe.
+## Known limitations
+
+- **Engagement is an approximate frontal-face / forward-facing-presence proxy,
+  not eye-gaze estimation.** A Haar cascade with hysteresis; it cannot tell
+  where the eyes are pointing.
+- **Lighting and camera placement affect engagement**, so results from one desk
+  do not transfer to another. Under less favourable lighting than the measured
+  trial's, engagement was informally observed to drop occasionally while the
+  user was still facing the camera.
+- **Push-to-talk always records a fixed 4.0 s**, which drives much of the
+  measured spoken-turn latency.
+- **Cloud connectivity is required** for the voice and vision paths.
+- **Camera index 0 may not be the right webcam.** USB cameras frequently
+  enumerate at index 1 or higher on Linux; use `--camera-index N`. There is no
+  auto-probe.
 - **Default microphone and output device selection is machine-dependent.** The
   code takes the system defaults and does not offer device selection.
-- **Engagement is an approximate frontal-face / forward-facing-presence proxy,
-  not eye-gaze estimation.** A Haar cascade with hysteresis. It cannot tell where
-  the eyes are pointing.
-- **Engagement behaviour depends on camera placement and lighting**, so results
-  from one desk do not transfer to another.
-- **CPU and RSS on Ubuntu cannot be inferred from macOS or Windows** and must be
-  measured on the target.
-- **PyBullet GUI behaviour and resource use are platform-dependent**; the
-  headless comparison in `MEASUREMENTS.md` exists to quantify that difference
-  rather than to assume it.
+- **Linux audio has not been exercised on Ubuntu hardware.** Which playback
+  backend is selected, and whether the in-process PortAudio fallback is
+  acceptable under the PyBullet GUI, is a property of the machine.
+- **CPU and RSS were measured on macOS, not on Ubuntu**, and do not transfer.
+- **Simulation is not physical hardware**: contact, payload dynamics and real
+  actuator behaviour are not exercised.
+- **Goal localisation is coarse left/center/right**, not metric visual servoing.
+  No SLAM, no persistent object tracking, no general manipulation, and one
+  orientation attempt per goal with no corrective re-aim.
+- **The optional reviewer proxy is evaluation convenience, not robot control.**

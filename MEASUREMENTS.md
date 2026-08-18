@@ -4,9 +4,12 @@ The four numbers [`SUBMISSION.md`](SUBMISSION.md) asks for — engagement
 reliability, response latency, CPU and memory — and exactly how to collect them.
 
 These are **small empirical demo trials on one machine**, not benchmarks. Each
-section says what it does and does not establish. The result tables below are
-deliberately empty: nothing is filled in until it has actually been run, and a
-row must name the machine it was run on.
+section says what it does and does not establish.
+
+All numbers below were collected on a **physical Apple-silicon M3 Mac** running
+the full PyBullet GUI + camera + voice demo. They are macOS development/demo
+measurements and are not Ubuntu measurements. Ubuntu 24.04 ARM64 deployment
+evidence is in §4.
 
 Setup is in [`README.md`](README.md). Every trial assumes the venv is active.
 
@@ -84,14 +87,24 @@ python src/engagement_demo.py --no-voice 2>&1 | tee engagement-trial.log
 
 | Field | Value |
 |---|---|
-| Machine / OS | _not yet collected_ |
-| Camera | |
-| Lighting / distance | |
-| Successful engages | / 10 |
-| Successful disengages | / 10 |
-| False engages (nobody attending) | |
-| False disengages (attending throughout) | |
-| Notes | |
+| Machine / OS | Physical Apple-silicon M3 Mac (macOS) |
+| Camera | Built-in laptop webcam, index 0 |
+| Lighting / distance | Ordinary room lighting, normal desk working distance |
+| Successful engages | 10 / 10 |
+| Successful disengages | 10 / 10 |
+| False engages (nobody attending) | 0 |
+| False disengages (attending throughout) | 0 |
+| Notes | Controlled 10-cycle trial. `--no-voice`, GUI and preview on. |
+
+This is a controlled 10-cycle result for one person, at one desk, under the
+tested camera and lighting conditions. It is not a gaze benchmark and does not
+generalise to other rooms.
+
+Separately, and **not** part of this trial: under less favourable lighting than
+the above, frontal-face engagement was informally observed to drop occasionally
+while the user was still facing the camera. That is consistent with the known
+limitation that Haar-based frontal-face detection depends on lighting and camera
+placement.
 
 ---
 
@@ -148,7 +161,7 @@ questions, including at least one scene-memory recall. For each turn, take the
 two lines and subtract the timestamps.
 
 > **Illustrative format only — these are invented lines, not a measurement.**
-> No timing in this document has been observed.
+> The measured values are in the results table below.
 >
 > ```text
 > [14:03:27.412] listening...
@@ -170,26 +183,33 @@ several failures says something the latency figure alone does not.
 
 ### Results
 
-Successful turns only:
+Physical M3 Mac. Five successful trials using the same prompt.
 
-| Turn | What was said | behavior | listening... | said: | Δ (s) |
-|---:|---|---|---|---|---:|
-| 1 | | | | | |
-| 2 | | | | | |
-| 3 | | | | | |
-| 4 | | | | | |
-| 5 | | | | | |
+| Turn | Δ (s) |
+|---:|---:|
+| 1 | 11.760 |
+| 2 | 8.131 |
+| 3 | 7.992 |
+| 4 | 8.157 |
+| 5 | 9.191 |
 
 | | seconds |
 |---|---:|
-| mean | _not yet collected_ |
-| min | |
-| max | |
+| mean | 9.046 |
+| min | 7.992 |
+| max | 11.760 |
 
-Failed or stale turns during the run (excluded from the summary above): _not yet
-recorded._
+Successful turns: 5 / 5. Failed or stale turns during the run: 0.
 
-Machine, network and whether the run was on Wi-Fi: _not yet recorded._
+Per-turn `behavior` was not retained alongside these five values, so the
+gesture/no-gesture split cannot be attributed here.
+
+Read this as the user-facing end-to-end proxy described above: recording-worker
+launch to successful playback launch/handoff. It includes the fixed 4.0-second
+recording window, speech-to-text, the language call, speech synthesis, any
+selected named pre-playback gesture, and the playback handoff. It is **not**
+model-only latency, it is **not** an acoustic first-audible-sample measurement,
+and the 4-second recording window is **not** subtracted.
 
 ---
 
@@ -280,31 +300,80 @@ Peak RSS for a whole run, where useful:
 
 ### Results
 
-`%CPU` is the mean of the 30 retained `top` refreshes, in percent of one core.
-`RSS` is from `ps`, converted to MB.
+Physical Apple-silicon M3 Mac, full PyBullet GUI + camera + voice demo. `%CPU`
+is percent of **one** logical core, so values above 100 % mean more than one core
+in use. macOS `top` was used rather than the Linux invocation above.
 
-| Condition | mean %CPU (of one core) | RSS (MB) |
-|---|---:|---:|
-| GUI, camera, voice — idle | _not yet collected_ | |
-| GUI, camera, voice — active | | |
-| `--headless`, camera, voice — idle | | |
-| `--no-voice`, GUI — idle | | |
+| Condition | mean %CPU (of one core) | range | RSS |
+|---|---:|---|---|
+| GUI, camera, voice — idle | 122.1 % | — | not retained |
+| GUI, camera, voice — active (representative sample) | 127.0 % | 98.5 – 145.2 % | 333,776 kB ≈ 326 MB |
 
-Context (from §0): _not yet recorded._
+Not collected: an idle RSS snapshot taken by the same procedure as the active
+one, and the `--headless` / `--no-voice` comparison rows. The GUI's share of the
+total therefore has not been quantified.
+
+These are macOS development/demo measurements. Ubuntu CPU and RSS were not
+measured and cannot be inferred from these.
 
 ---
 
-## Status
+---
 
-**No measurements in this file have been collected yet.** Every table is a
-placeholder, and the only numbers appearing anywhere above are inside a block
-explicitly labelled as an invented formatting example. The real numbers must come
-from a real run on a stated machine, and the Ubuntu 24.04 rows must come from
-actual Ubuntu 24.04 hardware — or a VM with the camera and audio devices passed
-through — rather than being extrapolated from a development machine running
-another OS.
+## 4. Ubuntu 24.04 deployment validation
 
-Once collected, these four measurements feed the ≤2-page technical note required
-by [`SUBMISSION.md`](SUBMISSION.md). That note has not been written yet; it is
-the final submission pass, and it is deliberately deferred until the evidence
-here is real.
+**Environment:** Ubuntu 24.04 ARM64 in a Multipass VM — 4 CPU cores, 8 GB RAM,
+Python 3.12, aarch64, no GPU requirement.
+
+**What succeeded:**
+
+- Environment creation and dependency installation.
+- PyBullet compiled and installed from source on ARM64 / Python 3.12.
+- OpenCV import, after a fix (below).
+- The automated test suite.
+- PyBullet headless runtime; `LampController` discovered all 5 actuated joints.
+- The semantic headless sequence
+  neutral → engage → look left → look right → face front + nod → neutral,
+  ending with `done; holding the final pose`.
+
+**Two real issues found and fixed:**
+
+1. OpenCV import failed because `libGL.so.1` was missing. Installing `libgl1`
+   fixed it, and the README apt line was updated.
+2. One test fake used a 10-second gate timeout that was too short on the slower
+   VM; it was raised to 30 seconds. Production timing, stale-turn handling,
+   engagement timing, polling, threading and epoch semantics were not changed.
+
+**Nonfatal PyBullet warnings**, which did not prevent joint discovery, control or
+headless execution: missing inertial metadata on decorative links, and
+`lamp_shade.stl` rendering extraction.
+
+**What could not be validated:** Multipass does not expose `/dev/video0`, so the
+full engagement demo failed cleanly with the intended actionable missing-camera
+error. Physical Ubuntu camera, microphone and speaker validation was therefore
+unavailable.
+
+In summary: full camera/microphone/speaker interaction was validated on physical
+macOS hardware. Ubuntu 24.04 ARM64 deployment was validated in a 4-core/8-GB VM
+through dependency installation, PyBullet build, OpenCV import, automated tests,
+clean missing-camera handling, and headless robot runtime. Physical Ubuntu
+peripheral validation was unavailable because the VM does not expose those
+devices.
+
+---
+
+## Status and limitations of this evidence
+
+Collected: engagement reliability (§1), spoken response latency (§2), CPU and an
+active memory snapshot (§3) — all on one physical M3 Mac — and Ubuntu 24.04
+ARM64 deployment evidence (§4).
+
+Not collected, and marked as such above: a procedure-consistent idle RSS
+snapshot, the headless/GUI CPU comparison rows, per-turn behaviour attribution
+for the latency trial, and any Ubuntu CPU or RSS figure.
+
+Every number here comes from a small trial on one machine under one set of
+conditions. They are indicative of what this system costs and how it feels to
+use; they are not benchmarks, and macOS figures do not transfer to the Ubuntu
+target. These measurements feed the ≤2-page technical note required by
+[`SUBMISSION.md`](SUBMISSION.md), which is [`TECHNICAL_NOTE.md`](TECHNICAL_NOTE.md).
