@@ -27,6 +27,17 @@ const TTS_VOICE = 'alloy';
 const MAX_SPEECH_INPUT_CHARS = 500;
 const MAX_OUTPUT_TOKENS = 1000;
 
+// Nested ceilings, same provenance:
+//   character.SYSTEM_PROMPT is the longest instructions block the app sends
+//   (~2.9kB); the longest `input` is a transcript plus a scene note.
+//   attention.OBSERVE_MAX_BYTES is the app's own ceiling on a camera frame, so
+//   an inline image that decodes to more than that did not come from the demo.
+const MAX_INSTRUCTIONS_CHARS = 6_000;
+const MAX_INPUT_TEXT_CHARS = 4_000;
+const MAX_IMAGE_BYTES = 400_000;
+const MAX_SCHEMA_CHARS = 8_000;
+const MAX_FORMAT_NAME_CHARS = 64;
+
 const ROUTES = {
   '/v1/responses': { maxBytes: 1_200_000, json: true, check: checkResponses },
   '/v1/audio/speech': { maxBytes: 8_192, json: true, check: checkSpeech },
@@ -38,6 +49,19 @@ const ROUTES = {
 const RESPONSES_KEYS = ['model', 'instructions', 'input', 'text', 'max_output_tokens'];
 const SPEECH_KEYS = ['model', 'voice', 'input', 'response_format'];
 const STT_FIELDS = ['file', 'model', 'response_format'];
+
+// The nested shapes `src/character.py` sends, spelled out key by key. Anything
+// that would make the Responses API fetch something -- input_file, file_url,
+// file_id, an http(s) image_url -- is absent from every one of these lists, so
+// it is refused by the same allowlist that refuses a typo.
+const MESSAGE_KEYS = ['role', 'content'];
+const TEXT_PART_KEYS = ['type', 'text'];
+const IMAGE_PART_KEYS = ['type', 'image_url'];
+const TEXT_KEYS = ['format'];
+const FORMAT_KEYS = ['type', 'name', 'strict', 'schema'];
+
+/** The only image the app produces: a bare base64 JPEG data URL, no charset. */
+const INLINE_JPEG = /^data:image\/jpeg;base64,([A-Za-z0-9+/]+={0,2})$/;
 
 /** @param {Request} request @param {Record<string,string|undefined>} env */
 export async function handleRequest(request, env, fetchImpl = globalThis.fetch) {
@@ -102,8 +126,13 @@ function normalizePath(rawUrl) {
 }
 
 // -- validation: returns a refusal string, or null to allow -----------------
-// The contents of `text` and `input` are never inspected or rewritten -- the
-// local app owns those schemas and validates every answer itself.
+// Prose -- a transcript, a scene note, a prompt -- is bounded but never
+// inspected or rewritten: the local app owns those schemas and validates every
+// answer itself. Structure is a different matter. `input` is checked key by
+// key, because a nested `input_file`/`file_url`/`file_id`, or an `image_url`
+// pointing at http(s), would make the Responses API fetch a URL of the
+// caller's choosing on my key -- a general-purpose fetcher hiding inside a
+// body whose top-level keys all look ordinary.
 
 function checkResponses(body, contentType) {
   const payload = parseJson(body, contentType);
@@ -116,7 +145,107 @@ function checkResponses(body, contentType) {
   if (!Number.isInteger(cap) || cap < 1 || cap > MAX_OUTPUT_TOKENS) {
     return `max_output_tokens must be an integer in 1..${MAX_OUTPUT_TOKENS}`;
   }
+  // `instructions` and `text` are optional only so that a one-line liveness
+  // probe still works; when present they must be the app's own shapes.
+  if (payload.instructions !== undefined) {
+    const bad = checkProse(payload.instructions, 'instructions', MAX_INSTRUCTIONS_CHARS);
+    if (bad) return bad;
+  }
+  return checkResponsesInput(payload.input) ?? checkResponsesText(payload.text);
+}
+
+/**
+ * Either shape `src/character.py` sends: the plain string of a reasoning turn
+ * (`respond`), or the one-frame vision message of `observe`/`locate`.
+ */
+function checkResponsesInput(input) {
+  if (typeof input === 'string') return checkProse(input, 'input', MAX_INPUT_TEXT_CHARS);
+  if (!Array.isArray(input)) return 'input must be a string or a one-message array';
+  if (input.length !== 1) return 'input may carry exactly one message';
+
+  const message = input[0];
+  if (!isObject(message)) return 'the input message must be a JSON object';
+  const extra = Object.keys(message).filter((k) => !MESSAGE_KEYS.includes(k));
+  if (extra.length) return `unsupported message keys: ${extra.sort().join(', ')}`;
+  if (message.role !== 'user') return 'the input message must have role "user"';
+
+  const content = message.content;
+  if (!Array.isArray(content) || content.length !== 2) {
+    return 'input content must be one text part followed by one image part';
+  }
+  return checkTextPart(content[0]) ?? checkImagePart(content[1]);
+}
+
+function checkTextPart(part) {
+  if (!isObject(part)) return 'each input content part must be a JSON object';
+  const extra = Object.keys(part).filter((k) => !TEXT_PART_KEYS.includes(k));
+  if (extra.length) return `unsupported content keys: ${extra.sort().join(', ')}`;
+  if (part.type !== 'input_text') {
+    return `the first content part must be input_text, not ${label(part.type)}`;
+  }
+  return checkProse(part.text, 'input_text.text', MAX_INPUT_TEXT_CHARS);
+}
+
+function checkImagePart(part) {
+  if (!isObject(part)) return 'each input content part must be a JSON object';
+  const extra = Object.keys(part).filter((k) => !IMAGE_PART_KEYS.includes(k));
+  if (extra.length) return `unsupported content keys: ${extra.sort().join(', ')}`;
+  if (part.type !== 'input_image') {
+    return `the second content part must be input_image, not ${label(part.type)}`;
+  }
+  const match = typeof part.image_url === 'string' ? INLINE_JPEG.exec(part.image_url) : null;
+  if (!match) return 'image_url must be an inline "data:image/jpeg;base64,..." frame';
+
+  const bytes = base64Bytes(match[1]);
+  if (bytes === null) return 'the inline image was not valid base64';
+  if (bytes > MAX_IMAGE_BYTES) return `the inline image exceeds ${MAX_IMAGE_BYTES} bytes`;
   return null;
+}
+
+/** The structured-output request: one json_schema format, nothing else. */
+function checkResponsesText(text) {
+  if (text === undefined) return null;
+  if (!isObject(text)) return 'text must be a JSON object';
+  const extra = Object.keys(text).filter((k) => !TEXT_KEYS.includes(k));
+  if (extra.length) return `unsupported text keys: ${extra.sort().join(', ')}`;
+
+  const format = text.format;
+  if (!isObject(format)) return 'text.format must be a JSON object';
+  const extraFormat = Object.keys(format).filter((k) => !FORMAT_KEYS.includes(k));
+  if (extraFormat.length) return `unsupported text.format keys: ${extraFormat.sort().join(', ')}`;
+  if (format.type !== 'json_schema') return 'only the json_schema text format is enabled';
+  if (typeof format.name !== 'string' || !format.name.trim()) {
+    return 'text.format.name must be a non-empty string';
+  }
+  if (format.name.length > MAX_FORMAT_NAME_CHARS) {
+    return `text.format.name is longer than ${MAX_FORMAT_NAME_CHARS} characters`;
+  }
+  if (format.strict !== undefined && typeof format.strict !== 'boolean') {
+    return 'text.format.strict must be a boolean';
+  }
+  if (!isObject(format.schema)) return 'text.format.schema must be a JSON object';
+  if (JSON.stringify(format.schema).length > MAX_SCHEMA_CHARS) {
+    return `text.format.schema is larger than ${MAX_SCHEMA_CHARS} characters`;
+  }
+  return null;
+}
+
+function checkProse(value, where, limit) {
+  if (typeof value !== 'string' || !value.trim()) return `${where} must be a non-empty string`;
+  if (value.length > limit) return `${where} is longer than ${limit} characters`;
+  return null;
+}
+
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/** Name a rejected value in a refusal without echoing anything unbounded. */
+const label = (v) => (typeof v === 'string' ? JSON.stringify(v.slice(0, 40)) : typeof v);
+
+/** Decoded length of a validated base64 run, or null if it cannot be one. */
+function base64Bytes(encoded) {
+  if (encoded.length % 4 !== 0) return null;
+  const padding = encoded.endsWith('==') ? 2 : encoded.endsWith('=') ? 1 : 0;
+  return (encoded.length / 4) * 3 - padding;
 }
 
 function checkSpeech(body, contentType) {

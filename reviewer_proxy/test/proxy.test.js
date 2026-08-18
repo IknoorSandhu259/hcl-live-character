@@ -28,6 +28,26 @@ const RESPONSES = {
 };
 const SPEECH = { model: 'tts-1', voice: 'alloy', input: 'Hello.', response_format: 'wav' };
 
+/** A base64 JPEG data URL of *bytes* bytes, as `character.observe` builds it. */
+const inlineJpeg = (bytes) =>
+  `data:image/jpeg;base64,${Buffer.alloc(bytes, 0xd8).toString('base64')}`;
+
+/** The one-frame vision request: `character.observe`/`locate`, shape for shape. */
+const vision = (content) => ({
+  model: 'gpt-5.6-luna',
+  instructions: 'You are the eye of a small desk lamp robot.',
+  input: [{ role: 'user', content }],
+  text: {
+    format: { type: 'json_schema', name: 'scene_observation', strict: true, schema: {} },
+  },
+  max_output_tokens: 200,
+});
+
+const VISION_CONTENT = [
+  { type: 'input_text', text: 'Look at this frame and describe the one clearest object.' },
+  { type: 'input_image', image_url: inlineJpeg(2048) },
+];
+
 /** Stub upstream that records its calls. */
 function stub(reply = { status: 200, body: '{"ok":true}', contentType: 'application/json' }) {
   const calls = [];
@@ -239,6 +259,178 @@ test('this is not a general relay: extra parameters are refused', async () => {
     fetchImpl,
   );
   assert.equal(stt.status, 400);
+  assert.equal(fetchImpl.calls.length, 0);
+});
+
+// -- the nested Responses surface -------------------------------------------
+//
+// The top-level keys of every payload below are the five the app sends, so
+// none of them is caught by the parameter allowlist. What makes them dangerous
+// is nested: a part that makes the Responses API go and fetch something on my
+// key. Each must be refused before `fetchImpl` is ever called.
+
+test('the app\'s own two request shapes are accepted', async () => {
+  const fetchImpl = stub();
+  const requests = [
+    jsonPost('/v1/responses', RESPONSES), // respond(): plain-string input
+    jsonPost('/v1/responses', vision(VISION_CONTENT)), // observe()/locate()
+  ];
+  for (const request of requests) {
+    assert.equal((await handleRequest(request, ENV, fetchImpl)).status, 200);
+  }
+  assert.equal(fetchImpl.calls.length, 2);
+});
+
+test('nested file and URL references never reach the upstream', async () => {
+  const fetchImpl = stub();
+  const bad = {
+    'input_file part': [
+      VISION_CONTENT[0],
+      { type: 'input_file', file_url: 'https://evil.example.com/payload.pdf' },
+    ],
+    'input_file by id': [VISION_CONTENT[0], { type: 'input_file', file_id: 'file-abc123' }],
+    'file_id smuggled onto the image part': [
+      VISION_CONTENT[0],
+      { type: 'input_image', image_url: inlineJpeg(64), file_id: 'file-abc123' },
+    ],
+    'file_url smuggled onto the image part': [
+      VISION_CONTENT[0],
+      { type: 'input_image', image_url: inlineJpeg(64), file_url: 'https://evil.example.com/x' },
+    ],
+    'https image URL': [
+      VISION_CONTENT[0],
+      { type: 'input_image', image_url: 'https://evil.example.com/probe.png' },
+    ],
+    'http image URL': [
+      VISION_CONTENT[0],
+      { type: 'input_image', image_url: 'http://169.254.169.254/latest/meta-data/' },
+    ],
+    'file:// image URL': [
+      VISION_CONTENT[0],
+      { type: 'input_image', image_url: 'file:///etc/passwd' },
+    ],
+  };
+  for (const [why, content] of Object.entries(bad)) {
+    const response = await handleRequest(jsonPost('/v1/responses', vision(content)), ENV, fetchImpl);
+    assert.equal(response.status, 400, why);
+  }
+  assert.equal(fetchImpl.calls.length, 0);
+});
+
+test('exactly one bounded inline JPEG is allowed, and no more', async () => {
+  const fetchImpl = stub();
+  const image = VISION_CONTENT[1];
+  const bad = {
+    'two images': [VISION_CONTENT[0], image, image],
+    'image without any text': [image, image],
+    'image before text': [image, VISION_CONTENT[0]],
+    'a lone text part': [VISION_CONTENT[0]],
+    'an empty content array': [],
+  };
+  for (const [why, content] of Object.entries(bad)) {
+    const response = await handleRequest(jsonPost('/v1/responses', vision(content)), ENV, fetchImpl);
+    assert.equal(response.status, 400, why);
+  }
+  // A second message is a second frame by another name.
+  const twoMessages = { ...vision(VISION_CONTENT), input: [
+    { role: 'user', content: VISION_CONTENT },
+    { role: 'user', content: VISION_CONTENT },
+  ] };
+  assert.equal((await handleRequest(jsonPost('/v1/responses', twoMessages), ENV, fetchImpl)).status, 400);
+  assert.equal(fetchImpl.calls.length, 0);
+});
+
+test('a decoded frame over the app image ceiling is refused', async () => {
+  const fetchImpl = stub();
+  // attention.OBSERVE_MAX_BYTES is 400_000; base64 of 400_001 bytes is ~533kB,
+  // comfortably inside the 1.2 MB body ceiling, so only the nested check
+  // catches it.
+  const oversized = vision([
+    VISION_CONTENT[0],
+    { type: 'input_image', image_url: inlineJpeg(400_001) },
+  ]);
+  const response = await handleRequest(jsonPost('/v1/responses', oversized), ENV, fetchImpl);
+  assert.equal(response.status, 400);
+  // ...while a frame at the ceiling still goes through.
+  const atLimit = vision([
+    VISION_CONTENT[0],
+    { type: 'input_image', image_url: inlineJpeg(400_000) },
+  ]);
+  assert.equal((await handleRequest(jsonPost('/v1/responses', atLimit), ENV, fetchImpl)).status, 200);
+  assert.equal(fetchImpl.calls.length, 1);
+});
+
+test('malformed and non-JPEG data URLs are refused', async () => {
+  const fetchImpl = stub();
+  const urls = [
+    'data:image/png;base64,iVBORw0KGgo=',
+    'data:application/pdf;base64,JVBERi0=',
+    'data:text/html;base64,PHNjcmlwdD4=',
+    'data:image/jpeg,notbase64at all',
+    'data:image/jpeg;base64,',
+    'data:image/jpeg;base64,****',
+    'data:image/jpeg;base64,QUJD\nQUJD',
+    'data:image/jpeg;charset=utf-8;base64,QUJDRA==',
+    'DATA:IMAGE/JPEG;BASE64,QUJDRA==',
+    'data:image/jpeg;base64,QUJDR', // length not a multiple of 4
+    '',
+    42,
+  ];
+  for (const image_url of urls) {
+    const payload = vision([VISION_CONTENT[0], { type: 'input_image', image_url }]);
+    const response = await handleRequest(jsonPost('/v1/responses', payload), ENV, fetchImpl);
+    assert.equal(response.status, 400, String(image_url).slice(0, 40));
+  }
+  assert.equal(fetchImpl.calls.length, 0);
+});
+
+test('unexpected nested content, roles and keys are refused', async () => {
+  const fetchImpl = stub();
+  const bad = [
+    // Unknown or tool-flavoured content types.
+    vision([VISION_CONTENT[0], { type: 'input_audio', image_url: inlineJpeg(64) }]),
+    vision([{ type: 'text', text: 'hi' }, VISION_CONTENT[1]]),
+    vision([{ type: 'input_text', text: 'hi', detail: 'high' }, VISION_CONTENT[1]]),
+    vision([VISION_CONTENT[0], { type: 'input_image', image_url: inlineJpeg(64), detail: 'high' }]),
+    // Content parts that are not objects at all.
+    vision(['hello', VISION_CONTENT[1]]),
+    vision([VISION_CONTENT[0], null]),
+    // Message-level surprises.
+    { ...vision(VISION_CONTENT), input: [{ role: 'system', content: VISION_CONTENT }] },
+    { ...vision(VISION_CONTENT), input: [{ role: 'user', content: VISION_CONTENT, id: 'msg_1' }] },
+    { ...vision(VISION_CONTENT), input: [{ role: 'user', content: 'plain string' }] },
+    { ...vision(VISION_CONTENT), input: [null] },
+    { ...vision(VISION_CONTENT), input: 42 },
+    { ...vision(VISION_CONTENT), input: {} },
+    // The structured-output request is a shape too.
+    { ...RESPONSES, text: { format: { type: 'text' } } },
+    { ...RESPONSES, text: { format: { type: 'json_schema', name: 'x', schema: [] } } },
+    { ...RESPONSES, text: { format: { type: 'json_schema', name: 'x', schema: {} }, verbosity: 'high' } },
+    { ...RESPONSES, text: { format: { type: 'json_schema', name: '', schema: {} } } },
+    { ...RESPONSES, text: 'json' },
+  ];
+  for (const payload of bad) {
+    const response = await handleRequest(jsonPost('/v1/responses', payload), ENV, fetchImpl);
+    assert.equal(response.status, 400, JSON.stringify(payload).slice(0, 80));
+  }
+  assert.equal(fetchImpl.calls.length, 0);
+});
+
+test('prose beyond the app contract is refused', async () => {
+  const fetchImpl = stub();
+  const bad = [
+    { ...RESPONSES, instructions: 'x'.repeat(6_001) },
+    { ...RESPONSES, instructions: '   ' },
+    { ...RESPONSES, instructions: 7 },
+    { ...RESPONSES, input: 'x'.repeat(4_001) },
+    { ...RESPONSES, input: '' },
+    vision([{ type: 'input_text', text: 'x'.repeat(4_001) }, VISION_CONTENT[1]]),
+    vision([{ type: 'input_text', text: '' }, VISION_CONTENT[1]]),
+  ];
+  for (const payload of bad) {
+    const response = await handleRequest(jsonPost('/v1/responses', payload), ENV, fetchImpl);
+    assert.equal(response.status, 400, JSON.stringify(payload).slice(0, 60));
+  }
   assert.equal(fetchImpl.calls.length, 0);
 });
 
