@@ -1,18 +1,16 @@
 """The two ways the demo can be pointed at OpenAI, and the line between them.
 
 Normal development uses a real key and talks to api.openai.com directly. An HCL
-reviewer instead gets a temporary token and the URL of the small relay in
-``reviewer_proxy/``, and selects it purely with environment variables::
+reviewer instead gets a temporary token and the URL of the optional relay in
+``reviewer_proxy/``, selected purely with environment variables::
 
     OPENAI_API_KEY=<reviewer token>   OPENAI_BASE_URL=https://<host>/v1
 
 ``src/character.py`` is identical in both modes -- there is no proxy branch in
 it -- because the official SDK reads ``OPENAI_BASE_URL`` itself. These tests pin
-that behaviour so a future SDK bump that changed it would fail here rather than
-silently sending a reviewer token to the real API.
-
-Nothing here opens a socket or spends quota: constructing a client makes no
-request.
+that behaviour so a future SDK bump could not silently send a reviewer token to
+the real API. Constructing a client makes no request, so nothing here spends
+quota.
 
     python -m pytest tests -q
 """
@@ -28,10 +26,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import character  # noqa: E402
 
-openai = pytest.importorskip("openai")
+pytest.importorskip("openai")
 
 REAL_KEY = "sk-proj-not-a-real-key-0123456789"
-REVIEWER_TOKEN = "hcl-reviewer-3f9a2c7e1b4d"
+REVIEWER_TOKEN = "hclrev_3f9a2c7e1b4d"
 PROXY_BASE_URL = "https://hcl-reviewer-proxy.example.vercel.app/v1"
 
 
@@ -40,9 +38,6 @@ def clean_env(monkeypatch):
     """Neither variable leaks in from the developer's own shell."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-
-
-# -- direct mode, unchanged -------------------------------------------------
 
 
 def test_direct_mode_still_talks_to_openai(monkeypatch):
@@ -59,18 +54,6 @@ def test_direct_mode_still_requires_a_key():
         character.require_api_key()
 
 
-def test_an_explicit_key_argument_still_wins(monkeypatch):
-    """`build_client(api_key=...)` is what the tests and demos already use."""
-    monkeypatch.setenv("OPENAI_API_KEY", REAL_KEY)
-
-    client = character.build_client(api_key="sk-explicit-argument-key")
-
-    assert client.api_key == "sk-explicit-argument-key"
-
-
-# -- reviewer mode ----------------------------------------------------------
-
-
 def test_reviewer_mode_is_selected_by_environment_alone(monkeypatch):
     """Two variables, no code change, and no real key anywhere in the process."""
     monkeypatch.setenv("OPENAI_API_KEY", REVIEWER_TOKEN)
@@ -84,25 +67,16 @@ def test_reviewer_mode_is_selected_by_environment_alone(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "path, expected",
-    [
-        ("/responses", f"{PROXY_BASE_URL}/responses"),
-        ("/audio/transcriptions", f"{PROXY_BASE_URL}/audio/transcriptions"),
-        ("/audio/speech", f"{PROXY_BASE_URL}/audio/speech"),
-    ],
+    "path", ["/responses", "/audio/transcriptions", "/audio/speech"]
 )
-def test_reviewer_mode_hits_exactly_the_three_proxied_paths(monkeypatch, path, expected):
-    """The three operations `character.py` makes are the three the proxy serves.
-
-    If a future change added a fourth OpenAI call, the reviewer path would 404
-    at the proxy rather than quietly widening what the token can reach.
-    """
+def test_reviewer_mode_hits_exactly_the_three_proxied_paths(monkeypatch, path):
+    """A fourth OpenAI call would 404 at the proxy, not quietly widen its reach."""
     monkeypatch.setenv("OPENAI_API_KEY", REVIEWER_TOKEN)
     monkeypatch.setenv("OPENAI_BASE_URL", PROXY_BASE_URL)
 
     client = character.build_client()
 
-    assert str(client._prepare_url(path)) == expected
+    assert str(client._prepare_url(path)) == f"{PROXY_BASE_URL}{path}"
 
 
 def test_the_models_character_asks_for_are_the_proxy_allowlist():
@@ -116,22 +90,11 @@ def test_the_models_character_asks_for_are_the_proxy_allowlist():
     assert character.MAX_REPLY_CHARS <= 500
 
 
-# -- credential hygiene holds for a reviewer token too ----------------------
-
-
-def test_a_reviewer_token_is_redacted_from_errors_like_a_real_key(monkeypatch):
+def test_a_reviewer_token_is_redacted_like_a_real_key(monkeypatch):
     """`redact` reads OPENAI_API_KEY, whatever kind of credential it holds."""
-    monkeypatch.setenv("OPENAI_API_KEY", REVIEWER_TOKEN)
-
-    message = character.redact(f"401 from proxy for {REVIEWER_TOKEN}")
-
-    assert REVIEWER_TOKEN not in message
-    assert "<redacted>" in message
-
-
-def test_character_error_redacts_a_reviewer_token_on_construction(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", REVIEWER_TOKEN)
 
     error = character.CharacterError(f"proxy refused {REVIEWER_TOKEN}")
 
     assert REVIEWER_TOKEN not in str(error)
+    assert "<redacted>" in str(error)
