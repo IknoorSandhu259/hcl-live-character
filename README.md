@@ -37,7 +37,7 @@ System packages:
 
 ```bash
 sudo apt update
-sudo apt install python3-venv python3-dev build-essential libportaudio2 pulseaudio-utils
+sudo apt install python3-venv python3-dev build-essential libgl1 libportaudio2 pulseaudio-utils
 ```
 
 - `python3-venv` — Ubuntu 24.04's default Python is 3.12, and it splits `venv`

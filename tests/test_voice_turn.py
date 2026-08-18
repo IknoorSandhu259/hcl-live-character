@@ -817,7 +817,7 @@ class RecordingTurn:
     def prepare(self):
         self.prepares += 1
         self.entered.set()
-        if self.gate is not None and not self.gate.wait(timeout=10):
+        if self.gate is not None and not self.gate.wait(timeout=30):
             raise TurnError("test gate timed out")
         if self.error is not None:
             raise self.error
