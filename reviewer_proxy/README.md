@@ -25,6 +25,17 @@ export OPENAI_BASE_URL='https://<vercel-host>/v1' # unset for normal direct mode
 
 Missing either → the proxy answers 503 to everything.
 
+## Layout
+
+One static function file per allowed operation — `api/v1/responses.js`,
+`api/v1/audio/transcriptions.js`, `api/v1/audio/speech.js` — all three
+delegating to `lib/proxy.js`. Do **not** replace these with a catch-all
+`api/[...path].js`: under the zero-config `/api` builder that compiles to a
+single-segment matcher, so `/api/v1/responses` falls through to the platform's
+blanket 404 (`X-Vercel-Error: NOT_FOUND`). The `vercel.json` rewrite maps
+`/v1/*` onto them; `https://<host>/api/v1` also works directly if the rewrite is
+ever removed.
+
 ## Deploy
 
 ```bash
@@ -56,14 +67,20 @@ c "$HOST/v1/responses" -H "Authorization: Bearer $TOKEN" $J \
   -d '{"model":"gpt-5.6-luna","instructions":"Reply ok.","input":"ping","max_output_tokens":16}'
 c "$HOST/v1/responses" $J -d '{}'                                        # no token
 c "$HOST/v1/responses" -H 'Authorization: Bearer wrong' $J -d '{}'       # wrong token
-c "$HOST/v1/chat/completions" -H "Authorization: Bearer $TOKEN" $J -d '{}'
+c "$HOST/v1/chat/completions" -H "Authorization: Bearer $TOKEN" $J -d '{}' # platform 404
 c -X GET "$HOST/v1/responses" -H "Authorization: Bearer $TOKEN"
 c "$HOST/v1/responses" -H "Authorization: Bearer $TOKEN" $J \
   -d '{"model":"gpt-4o","input":"ping","max_output_tokens":16}'; echo
 # expect: 200 401 401 404 405 400
 ```
 
+Unsupported paths are refused by Vercel's own 404 before reaching the function;
+`lib/proxy.js` refuses them too, as defence in depth.
+
 Offline tests: `node --test` here, `python -m pytest tests -q` in the repo root.
+Routing itself: `npx vercel build`, then check `.vercel/output/functions/` holds
+`api/v1/responses.func`, `api/v1/audio/speech.func` and
+`api/v1/audio/transcriptions.func`.
 
 ## Revoke
 

@@ -10,6 +10,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import { handleRequest, redact } from '../lib/proxy.js';
 
@@ -83,6 +85,19 @@ const transcription = (fields = {}) =>
     response_format: 'json',
     ...fields,
   });
+
+// -- deployment routing -----------------------------------------------------
+
+test('each allowed endpoint has a static Vercel entrypoint file', () => {
+  // A catch-all `api/[...path].js` compiles to a single-segment matcher under
+  // the zero-config /api builder, so `/api/v1/responses` fell through to the
+  // platform's blanket 404. Static paths are matched by the filesystem
+  // handler and cannot regress that way.
+  for (const endpoint of ['/v1/responses', '/v1/audio/speech', '/v1/audio/transcriptions']) {
+    const entrypoint = new URL(`../api${endpoint}.js`, import.meta.url);
+    assert.ok(existsSync(fileURLToPath(entrypoint)), `missing api${endpoint}.js`);
+  }
+});
 
 // -- the three allowed operations ------------------------------------------
 
